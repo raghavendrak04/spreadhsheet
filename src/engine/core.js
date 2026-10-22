@@ -1,928 +1,130 @@
-// ─────────────────────────────────────────────────────────────
-//  Operator precedence for expression parsing
-// ─────────────────────────────────────────────────────────────
+// Pure spreadsheet engine. This module intentionally has no React or DOM imports.
 
-const OPERATOR_PRECEDENCE = { '+': 1, '-': 1, '*': 2, '/': 2 }
+const DEFAULT_ROW_HEIGHT = 24
+const DEFAULT_COLUMN_WIDTH = 120
 const MAX_UNDO_HISTORY = 100
+const DEFAULT_STYLE = Object.freeze({ bold: false, italic: false, underline: false, bg: 'white', color: '#202124', align: 'left', fontSize: 13, numberFormat: 'general' })
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 
-// ─────────────────────────────────────────────────────────────
-//  Column / Cell coordinate utilities
-// ─────────────────────────────────────────────────────────────
+export function columnLetterToIndex(letter) { let result = 0; for (const character of String(letter).toUpperCase()) result = result * 26 + character.charCodeAt(0) - 64; return result - 1 }
+export function indexToColumnLetter(index) { let value = index + 1; let result = ''; while (value > 0) { value -= 1; result = String.fromCharCode(65 + (value % 26)) + result; value = Math.floor(value / 26) } return result }
+export function indexToCellKey(row, col) { return `${indexToColumnLetter(col)}${row + 1}` }
+export function parseCellKey(value) { const match = String(value).trim().match(/^\$?([A-Za-z]+)\$?(\d+)$/); return match ? { row: Number(match[2]) - 1, col: columnLetterToIndex(match[1]) } : null }
+export function normaliseRange(range) { const start = range.start ?? range.anchor ?? range; const end = range.end ?? range.focus ?? range; return { startRow: Math.min(start.row ?? start.r, end.row ?? end.r), endRow: Math.max(start.row ?? start.r, end.row ?? end.r), startCol: Math.min(start.col ?? start.c, end.col ?? end.c), endCol: Math.max(start.col ?? start.c, end.col ?? end.c) } }
+export function rangeToA1(range) { const value = normaliseRange(range); const start = indexToCellKey(value.startRow, value.startCol); const end = indexToCellKey(value.endRow, value.endCol); return start === end ? start : `${start}:${end}` }
 
-function columnLetterToIndex(columnLetter) {
-    let index = 0
-    for (let i = 0; i < columnLetter.length; i++) {
-        index = index * 26 + (columnLetter.charCodeAt(i) - 64)
-    }
-    return index - 1
-}
+function cloneMap(map) { return new Map(Array.from(map, ([key, value]) => [key, { ...value }])) }
+function cloneFilters(filters) { return new Map(Array.from(filters, ([column, definition]) => [column, { ...definition, values: definition.values ? [...definition.values] : null, conditions: (definition.conditions ?? []).map(condition => ({ ...condition })) }])) }
+function stateJSON(state) { return JSON.stringify({ ...state, cells: Array.from(state.cells.entries()), styles: Array.from(state.styles.entries()), filters: Array.from(state.filters.entries()) }) }
+function parseNumeric(value) { if (typeof value === 'number' && Number.isFinite(value)) return value; const text = String(value ?? '').trim(); if (!text) return null; const percentage = text.endsWith('%'); const stripped = text.replace(/[,$%\s]/g, ''); if (!/^-?\d+(\.\d+)?$/.test(stripped)) return null; const parsed = Number(stripped); return percentage ? parsed / 100 : parsed }
+function parseDate(value) { const text = String(value ?? '').trim(); let match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/); if (match) return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))); match = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (match) return new Date(Date.UTC(Number(match[3]), Number(match[1]) - 1, Number(match[2]))); match = text.match(/^(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})$/); if (match) { const month = MONTHS.indexOf(match[2].slice(0, 3).toLowerCase()); if (month >= 0) return new Date(Date.UTC(Number(match[3]), month, Number(match[1]))) } return null }
+function dateToIso(date) { return date ? date.toISOString().slice(0, 10) : null }
+function normaliseText(value) { return String(value ?? '').trim().toLowerCase() }
+function looksLikeTotal(value) { return /^(grand\s+)?(total|totals|subtotal|sum)\b/i.test(String(value ?? '').trim()) }
 
-function indexToCellKey(row, col) {
-    let columnLabel = ''
-    let colNumber = col + 1
-    while (colNumber > 0) {
-        colNumber--
-        columnLabel = String.fromCharCode(65 + (colNumber % 26)) + columnLabel
-        colNumber = Math.floor(colNumber / 26)
-    }
-    return columnLabel + (row + 1)
-}
-
-function parseCellKey(cellKey) {
-    const match = cellKey.match(/^([A-Z]+)(\d+)$/)
-    if (!match) return null
-    return { row: parseInt(match[2]) - 1, col: columnLetterToIndex(match[1]) }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Dependency graph (tracks which cells depend on which)
-// ─────────────────────────────────────────────────────────────
-
-function createDependencyGraph() {
-    const forwardEdges = new Map()
-    const reverseEdges = new Map()
-
-    function addDependency(cell, dependsOn) {
-        if (!forwardEdges.has(cell)) forwardEdges.set(cell, new Set())
-        if (!reverseEdges.has(dependsOn)) reverseEdges.set(dependsOn, new Set())
-        forwardEdges.get(cell).add(dependsOn)
-        reverseEdges.get(dependsOn).add(cell)
-    }
-
-    function removeAllDependencies(cell) {
-        const deps = forwardEdges.get(cell)
-        if (deps) {
-            for (const dep of deps) {
-                if (reverseEdges.has(dep)) {
-                    reverseEdges.get(dep).delete(cell)
-                    if (reverseEdges.get(dep).size === 0) reverseEdges.delete(dep)
-                }
-            }
-            forwardEdges.delete(cell)
-        }
-        const dependents = reverseEdges.get(cell)
-        if (dependents) {
-            for (const dependent of dependents) {
-                if (forwardEdges.has(dependent)) {
-                    forwardEdges.get(dependent).delete(cell)
-                    if (forwardEdges.get(dependent).size === 0) forwardEdges.delete(dependent)
-                }
-            }
-            reverseEdges.delete(cell)
-        }
-    }
-
-    function getDependencies(cell) {
-        return forwardEdges.get(cell) || new Set()
-    }
-
-    function getDependents(cell) {
-        return reverseEdges.get(cell) || new Set()
-    }
-
-    function getAllDependentsRecursive(cell, visited = new Set()) {
-        if (visited.has(cell)) return new Set()
-        visited.add(cell)
-        const result = new Set()
-        for (const dependent of getDependents(cell)) {
-            result.add(dependent)
-            for (const indirect of getAllDependentsRecursive(dependent, visited)) {
-                result.add(indirect)
-            }
-        }
-        return result
-    }
-
-    function hasCycle(startCell) {
-        const visited = new Set()
-        const recursionStack = new Set()
-        const dfs = (node) => {
-            if (recursionStack.has(node)) return true
-            if (visited.has(node)) return false
-            visited.add(node)
-            recursionStack.add(node)
-            for (const dep of getDependencies(node)) {
-                if (dfs(dep)) return true
-            }
-            recursionStack.delete(node)
-            return false
-        }
-        return dfs(startCell)
-    }
-
-    function topologicalSort(affectedCells) {
-        const inDegree = new Map()
-        const queue = []
-        const sorted = []
-
-        for (const cell of affectedCells) inDegree.set(cell, 0)
-        for (const cell of affectedCells) {
-            for (const dep of getDependencies(cell)) {
-                if (affectedCells.has(dep)) {
-                    inDegree.set(cell, (inDegree.get(cell) || 0) + 1)
-                }
-            }
-        }
-        for (const cell of affectedCells) {
-            if (inDegree.get(cell) === 0) queue.push(cell)
-        }
-        while (queue.length > 0) {
-            const cell = queue.shift()
-            sorted.push(cell)
-            for (const dependent of getDependents(cell)) {
-                if (affectedCells.has(dependent)) {
-                    inDegree.set(dependent, inDegree.get(dependent) - 1)
-                    if (inDegree.get(dependent) === 0) queue.push(dependent)
-                }
-            }
-        }
-        return sorted
-    }
-
-    function clear() {
-        forwardEdges.clear()
-        reverseEdges.clear()
-    }
-
-    return {
-        addDependency,
-        removeAllDependencies,
-        getDependencies,
-        getDependents,
-        getAllDependentsRecursive,
-        hasCycle,
-        topologicalSort,
-        clear
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Tokenizer — converts formula string into tokens
-// ─────────────────────────────────────────────────────────────
+export function formatCellValue(value, style = DEFAULT_STYLE) { if (value === null || value === undefined || value === '') return ''; const text = String(value); const numeric = parseNumeric(value); if (style.numberFormat === 'date') return dateToIso(parseDate(value)) ?? text; if (numeric === null || style.numberFormat === 'general') return text; if (style.numberFormat === 'currency') return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(numeric); if (style.numberFormat === 'percent') return new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 0 }).format(numeric); return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(numeric) }
 
 function tokenize(expression) {
-    const tokens = []
-    let position = 0
-
-    while (position < expression.length) {
-        const char = expression[position]
-
-        if (char === ' ') {
-            position++
-            continue
-        }
-
-        if (char === '(' || char === ')') {
-            tokens.push({ type: 'paren', value: char })
-            position++
-            continue
-        }
-
-        if ('+-*/,'.includes(char)) {
-            tokens.push({ type: 'operator', value: char })
-            position++
-            continue
-        }
-
-        if (char === ':') {
-            tokens.push({ type: 'range', value: ':' })
-            position++
-            continue
-        }
-
-        if ((char >= '0' && char <= '9') || char === '.') {
-            let numberStr = ''
-            while (position < expression.length && ((expression[position] >= '0' && expression[position] <= '9') || expression[position] === '.')) {
-                numberStr += expression[position]
-                position++
-            }
-            tokens.push({ type: 'number', value: parseFloat(numberStr) })
-            continue
-        }
-
-        if ((char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')) {
-            let identifier = ''
-            while (position < expression.length && ((expression[position] >= 'A' && expression[position] <= 'Z') || (expression[position] >= 'a' && expression[position] <= 'z') || (expression[position] >= '0' && expression[position] <= '9'))) {
-                identifier += expression[position].toUpperCase()
-                position++
-            }
-            if (position < expression.length && expression[position] === ':') {
-                tokens.push({ type: 'cell', value: identifier })
-            } else {
-                const cellMatch = identifier.match(/^([A-Z]+)(\d+)$/)
-                if (cellMatch) {
-                    tokens.push({ type: 'cell', value: identifier })
-                } else {
-                    tokens.push({ type: 'function', value: identifier })
-                }
-            }
-            continue
-        }
-
-        throw new Error(`Unexpected character: ${char}`)
-    }
-
-    return tokens
+  const tokens = []; let index = 0
+  while (index < expression.length) {
+    const rest = expression.slice(index)
+    if (/^\s/.test(rest)) { index += 1; continue }
+    const reference = rest.match(/^\$?[A-Za-z]+\$?\d+/)
+    if (reference) { tokens.push({ type: 'reference', value: reference[0].toUpperCase() }); index += reference[0].length; continue }
+    const number = rest.match(/^(?:\d+\.?\d*|\.\d+)/)
+    if (number) { tokens.push({ type: 'number', value: Number(number[0]) }); index += number[0].length; continue }
+    const word = rest.match(/^[A-Za-z_][A-Za-z0-9_]*/)
+    if (word) { tokens.push({ type: 'word', value: word[0].toUpperCase() }); index += word[0].length; continue }
+    const character = expression[index]
+    if ('+-*/(),:'.includes(character)) { tokens.push({ type: character, value: character }); index += 1; continue }
+    throw new Error('PARSE')
+  }
+  return tokens
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Parser — converts tokens into an AST using shunting-yard
-// ─────────────────────────────────────────────────────────────
-
-function parseTokensToAST(tokens) {
-    const outputQueue = []
-    const operatorStack = []
-    let position = 0
-
-    while (position < tokens.length) {
-        const token = tokens[position]
-
-        if (token.type === 'number' || token.type === 'cell') {
-            outputQueue.push(token)
-            position++
-        } else if (token.type === 'function') {
-            operatorStack.push(token)
-            position++
-        } else if (token.type === 'operator') {
-            while (
-                operatorStack.length > 0 &&
-                operatorStack[operatorStack.length - 1].type === 'operator' &&
-                OPERATOR_PRECEDENCE[operatorStack[operatorStack.length - 1].value] >= OPERATOR_PRECEDENCE[token.value]
-            ) {
-                outputQueue.push(operatorStack.pop())
-            }
-            operatorStack.push(token)
-            position++
-        } else if (token.type === 'paren' && token.value === '(') {
-            operatorStack.push(token)
-            position++
-        } else if (token.type === 'paren' && token.value === ')') {
-            while (operatorStack.length > 0 && operatorStack[operatorStack.length - 1].value !== '(') {
-                outputQueue.push(operatorStack.pop())
-            }
-            if (operatorStack.length > 0 && operatorStack[operatorStack.length - 1].value === '(') {
-                operatorStack.pop()
-            }
-            if (operatorStack.length > 0 && operatorStack[operatorStack.length - 1].type === 'function') {
-                const funcToken = operatorStack.pop()
-                if (outputQueue.length > 0 && outputQueue[outputQueue.length - 1].type === 'range') {
-                    const rangeToken = outputQueue.pop()
-                    outputQueue.push({ type: 'function', name: funcToken.value, range: rangeToken })
-                } else {
-                    outputQueue.push(funcToken)
-                }
-            }
-            position++
-        } else if (token.type === 'range') {
-            if (outputQueue.length < 2) throw new Error('Invalid range syntax')
-            const endCell = outputQueue.pop()
-            const startCell = outputQueue.pop()
-            if (startCell.type !== 'cell' || endCell.type !== 'cell') {
-                throw new Error('Range must be between two cell references')
-            }
-            outputQueue.push({ type: 'range', start: startCell.value, end: endCell.value })
-            position++
-        } else {
-            position++
-        }
-    }
-
-    while (operatorStack.length > 0) {
-        if (operatorStack[operatorStack.length - 1].value === '(') {
-            throw new Error('Mismatched parentheses')
-        }
-        outputQueue.push(operatorStack.pop())
-    }
-
-    return buildASTFromRPN(outputQueue)
+function parseFormula(expression) {
+  const tokens = tokenize(expression); let cursor = 0
+  const peek = () => tokens[cursor]
+  const take = type => { if (!peek() || peek().type !== type) throw new Error('PARSE'); return tokens[cursor++] }
+  function primary() {
+    const token = peek(); if (!token) throw new Error('PARSE')
+    if (token.type === 'number') { cursor += 1; return { type: 'number', value: token.value } }
+    if (token.type === 'reference') { cursor += 1; const start = token.value; if (peek()?.type === ':') { take(':'); return { type: 'range', start, end: take('reference').value } } return { type: 'reference', value: start } }
+    if (token.type === 'word') { cursor += 1; const name = token.value; take('('); const args = []; if (peek()?.type !== ')') { args.push(addSubtract()); while (peek()?.type === ',') { take(','); args.push(addSubtract()) } } take(')'); return { type: 'function', name, args } }
+    if (token.type === '(') { take('('); const value = addSubtract(); take(')'); return value }
+    if (token.type === '-') { take('-'); return { type: 'negate', child: primary() } }
+    throw new Error('PARSE')
+  }
+  function multiplyDivide() { let result = primary(); while (peek()?.type === '*' || peek()?.type === '/') { const operator = tokens[cursor++].type; result = { type: 'binary', operator, left: result, right: primary() } } return result }
+  function addSubtract() { let result = multiplyDivide(); while (peek()?.type === '+' || peek()?.type === '-') { const operator = tokens[cursor++].type; result = { type: 'binary', operator, left: result, right: multiplyDivide() } } return result }
+  const ast = addSubtract(); if (cursor !== tokens.length) throw new Error('PARSE'); return ast
 }
 
-function buildASTFromRPN(rpnTokens) {
-    const stack = []
-
-    for (const token of rpnTokens) {
-        if (token.type === 'number' || token.type === 'cell' || token.type === 'range') {
-            stack.push(token)
-        } else if (token.type === 'operator') {
-            if (stack.length < 2) throw new Error('Invalid expression')
-            const right = stack.pop()
-            const left = stack.pop()
-            stack.push({ type: 'binary', operator: token.value, left, right })
-        } else if (token.type === 'function') {
-            if (token.range) {
-                stack.push(token)
-            } else {
-                if (stack.length === 0) throw new Error(`Function ${token.value} requires arguments`)
-                const argument = stack.pop()
-                if (argument.type === 'range') {
-                    stack.push({ type: 'function', name: token.value, range: argument })
-                } else {
-                    throw new Error(`Function ${token.value} requires a range`)
-                }
-            }
-        }
-    }
-
-    if (stack.length !== 1) throw new Error('Invalid expression')
-    return stack[0]
+function rangeCoordinates(start, end) { const first = parseCellKey(start); const last = parseCellKey(end); if (!first || !last) throw new Error('REF'); const result = []; for (let row = Math.min(first.row, last.row); row <= Math.max(first.row, last.row); row += 1) for (let col = Math.min(first.col, last.col); col <= Math.max(first.col, last.col); col += 1) result.push({ row, col }); return result }
+function evaluateAst(node, readReference) {
+  if (node.type === 'number') return node.value
+  if (node.type === 'reference') return readReference(node.value)
+  if (node.type === 'range') return rangeCoordinates(node.start, node.end).map(cell => readReference(indexToCellKey(cell.row, cell.col)))
+  if (node.type === 'negate') { const numeric = parseNumeric(evaluateAst(node.child, readReference)); if (numeric === null) throw new Error('VALUE'); return -numeric }
+  if (node.type === 'binary') { const left = parseNumeric(evaluateAst(node.left, readReference)); const right = parseNumeric(evaluateAst(node.right, readReference)); if (left === null || right === null) throw new Error('VALUE'); if (node.operator === '+') return left + right; if (node.operator === '-') return left - right; if (node.operator === '*') return left * right; if (node.operator === '/') { if (right === 0) throw new Error('VALUE'); return left / right } }
+  if (node.type === 'function') { const values = node.args.flatMap(argument => { const value = evaluateAst(argument, readReference); return Array.isArray(value) ? value : [value] }).map(parseNumeric).filter(value => value !== null); if (!['SUM', 'AVG', 'MIN', 'MAX'].includes(node.name)) throw new Error('PARSE'); if (node.name === 'SUM') return values.reduce((sum, value) => sum + value, 0); if (node.name === 'AVG') return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; if (node.name === 'MIN') return values.length ? Math.min(...values) : 0; return values.length ? Math.max(...values) : 0 }
+  throw new Error('PARSE')
 }
+function formulaError(error) { if (error?.message === 'CYCLE') return '#CYCLE!'; if (error?.message === 'REF') return '#REF!'; if (error?.message === 'VALUE') return '#VALUE!'; return '#PARSE!' }
 
-// ─────────────────────────────────────────────────────────────
-//  Evaluator — walks the AST and computes values
-// ─────────────────────────────────────────────────────────────
+function transformFormula(formula, transform) { if (!String(formula).startsWith('=')) return formula; return formula.replace(/(\$?)([A-Za-z]+)(\$?)(\d+)/g, (whole, absCol, letters, absRow, rowNumber) => { const ref = { row: Number(rowNumber) - 1, col: columnLetterToIndex(letters), absCol: Boolean(absCol), absRow: Boolean(absRow) }; const next = transform(ref); if (!next || next.row < 0 || next.col < 0) return '#REF!'; return `${next.absCol ? '$' : ''}${indexToColumnLetter(next.col)}${next.absRow ? '$' : ''}${next.row + 1}` }) }
+export function shiftFormulaForFill(formula, rowDelta, colDelta) { return transformFormula(formula, ref => ({ ...ref, row: ref.absRow ? ref.row : ref.row + rowDelta, col: ref.absCol ? ref.col : ref.col + colDelta })) }
+function shiftFormulaForStructure(formula, type, atIndex) { return transformFormula(formula, ref => { const next = { ...ref }; if (type === 'insertRow' && next.row >= atIndex) next.row += 1; if (type === 'deleteRow') { if (next.row === atIndex) return null; if (next.row > atIndex) next.row -= 1 } if (type === 'insertColumn' && next.col >= atIndex) next.col += 1; if (type === 'deleteColumn') { if (next.col === atIndex) return null; if (next.col > atIndex) next.col -= 1 } return next }) }
 
-function expandCellRange(startKey, endKey) {
-    const startMatch = startKey.match(/^([A-Z]+)(\d+)$/)
-    const endMatch = endKey.match(/^([A-Z]+)(\d+)$/)
-    if (!startMatch || !endMatch) throw new Error('REF')
-
-    const startCol = columnLetterToIndex(startMatch[1])
-    const startRow = parseInt(startMatch[2]) - 1
-    const endCol = columnLetterToIndex(endMatch[1])
-    const endRow = parseInt(endMatch[2]) - 1
-
-    const cells = []
-    for (let r = Math.min(startRow, endRow); r <= Math.max(startRow, endRow); r++) {
-        for (let c = Math.min(startCol, endCol); c <= Math.max(startCol, endCol); c++) {
-            cells.push(indexToCellKey(r, c))
-        }
-    }
-    return cells
-}
-
-function evaluateAST(ast, getCellValue, visited = new Set()) {
-    if (!ast) return 0
-
-    if (ast.type === 'number') return ast.value
-
-    if (ast.type === 'cell') {
-        const key = ast.value
-        if (visited.has(key)) throw new Error('CIRCULAR')
-        visited.add(key)
-        const value = getCellValue(key, visited)
-        visited.delete(key)
-        return value
-    }
-
-    if (ast.type === 'range') throw new Error('VALUE')
-
-    if (ast.type === 'binary') {
-        const leftVal = evaluateAST(ast.left, getCellValue, visited)
-        const rightVal = evaluateAST(ast.right, getCellValue, visited)
-        if (typeof leftVal !== 'number' || typeof rightVal !== 'number') throw new Error('VALUE')
-        switch (ast.operator) {
-            case '+': return leftVal + rightVal
-            case '-': return leftVal - rightVal
-            case '*': return leftVal * rightVal
-            case '/':
-                if (rightVal === 0) throw new Error('VALUE')
-                return leftVal / rightVal
-            default: throw new Error('VALUE')
-        }
-    }
-
-    if (ast.type === 'function') {
-        const rangeCells = expandCellRange(ast.range.start, ast.range.end)
-        const values = rangeCells.map(cellKey => {
-            if (visited.has(cellKey)) throw new Error('CIRCULAR')
-            visited.add(cellKey)
-            const value = getCellValue(cellKey, visited)
-            visited.delete(cellKey)
-            const num = parseFloat(value)
-            return isNaN(num) ? 0 : num
-        })
-
-        switch (ast.name) {
-            case 'SUM': return values.reduce((sum, val) => sum + val, 0)
-            case 'AVG': return values.length === 0 ? 0 : values.reduce((sum, val) => sum + val, 0) / values.length
-            case 'MIN': return values.length === 0 ? 0 : Math.min(...values)
-            case 'MAX': return values.length === 0 ? 0 : Math.max(...values)
-            default: throw new Error('VALUE')
-        }
-    }
-
-    throw new Error('VALUE')
-}
-
-function evaluateFormula(expression, getCellValue) {
-    try {
-        if (!expression || expression.trim() === '') return { value: '', error: null }
-        if (!expression.startsWith('=')) return { value: expression, error: null }
-
-        const formulaBody = expression.slice(1).trim()
-        if (formulaBody === '') return { value: '', error: null }
-
-        const tokens = tokenize(formulaBody)
-        const ast = parseTokensToAST(tokens)
-        const result = evaluateAST(ast, getCellValue)
-        return { value: result, error: null }
-    } catch (error) {
-        if (error.message === 'CIRCULAR') return { value: null, error: '#CYCLE!' }
-        if (error.message === 'REF') return { value: null, error: '#REF!' }
-        if (error.message === 'VALUE') return { value: null, error: '#VALUE!' }
-        return { value: null, error: '#PARSE!' }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Reference shifting (for insert/delete row/col)
-// ─────────────────────────────────────────────────────────────
-
-function shiftCellReferences(formula, rowShift, colShift, atIndex, isColumnOperation = false) {
-    if (!formula || !formula.startsWith('=')) return formula
-
-    // Shift cell references in formulas when rows/columns are inserted or deleted
-    // Note: This function modifies ALL cell references in the formula, including those
-    // in ranges. The logic ensures references shift correctly based on the operation type.
-    return formula.replace(/([A-Z]+)(\d+)/g, (match, colLetter, rowStr) => {
-        const colIdx = columnLetterToIndex(colLetter)
-        const rowIdx = parseInt(rowStr) - 1
-        let newRow = rowIdx
-        let newCol = colIdx
-
-        if (isColumnOperation) {
-            // For column operations, only shift columns at or after the insertion/deletion point
-            if (colIdx >= atIndex) newCol = colIdx + colShift
-        } else {
-            // For row operations, only shift rows at or after the insertion/deletion point
-            if (rowIdx >= atIndex) newRow = rowIdx + rowShift
-        }
-
-        // Preserve original reference if shifting would result in invalid coordinates
-        // This prevents formulas from breaking when rows/cols are deleted at boundaries
-        if (newRow < 0 || newCol < 0) return match
-        return indexToCellKey(newRow, newCol)
-    })
-}
-
-function extractCellReferences(formula) {
-    const references = new Set()
-    // Extract cell references using regex
-    // Note: This regex matches cell references like A1, B2, AA10, etc.
-    // It does NOT extract individual cells from ranges (e.g., A1:A5 only extracts A1 and A5)
-    const regex = /([A-Z]+\d+)/g
-    let match
-    while ((match = regex.exec(formula)) !== null) {
-        references.add(match[1])
-    }
-    return references
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Main engine factory
-// ─────────────────────────────────────────────────────────────
+function preserveTextCase(source, replacement) { if (source === source.toUpperCase()) return replacement.toUpperCase(); if (source === source.toLowerCase()) return replacement.toLowerCase(); return replacement[0].toUpperCase() + replacement.slice(1).toLowerCase() }
+function parseSeriesValue(value) { const text = String(value ?? ''); const numeric = text.match(/^(.*?)(\d+)$/); if (numeric) return { kind: 'suffix', prefix: numeric[1], value: Number(numeric[2]), padding: numeric[2].length }; const date = parseDate(text); if (date) return { kind: 'date', value: date, source: text }; const weekday = WEEKDAYS.indexOf(text.slice(0, 3).toLowerCase()); if (weekday >= 0) return { kind: 'weekday', value: weekday, source: text }; const month = MONTHS.indexOf(text.slice(0, 3).toLowerCase()); if (month >= 0) return { kind: 'month', value: month, source: text }; const number = parseNumeric(text); if (number !== null && /^-?\d+(\.\d+)?$/.test(text.trim())) return { kind: 'number', value: number }; return { kind: 'copy', value: text } }
+function formatDateLike(source, date) { if (/^\d{4}-/.test(source)) return dateToIso(date); if (/^\d{1,2}\//.test(source)) return `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()}`; const month = preserveTextCase(source.match(/\s([A-Za-z]{3,})\s/)?.[1] ?? 'Jan', MONTHS[date.getUTCMonth()]); return `${date.getUTCDate()} ${month} ${date.getUTCFullYear()}` }
+function seriesValue(seed, index) { if (seed.kind === 'copy') return seed.value; if (seed.kind === 'number') return String(seed.value + (seed.step ?? 0) * index); if (seed.kind === 'suffix') return `${seed.prefix}${String(seed.value + (seed.step ?? 0) * index).padStart(seed.padding, '0')}`; if (seed.kind === 'date') { const date = new Date(seed.value); date.setUTCDate(date.getUTCDate() + (seed.step ?? 1) * index); return formatDateLike(seed.source, date) } if (seed.kind === 'weekday') return preserveTextCase(seed.source, WEEKDAYS[(seed.value + index) % WEEKDAYS.length]); if (seed.kind === 'month') return preserveTextCase(seed.source, MONTHS[(seed.value + index) % MONTHS.length]); return '' }
+function compareValues(left, right) { const leftBlank = String(left ?? '').trim() === ''; const rightBlank = String(right ?? '').trim() === ''; if (leftBlank || rightBlank) return leftBlank === rightBlank ? 0 : leftBlank ? 1 : -1; const leftNumber = parseNumeric(left); const rightNumber = parseNumeric(right); if (leftNumber !== null && rightNumber !== null) return leftNumber - rightNumber; if (leftNumber !== null) return -1; if (rightNumber !== null) return 1; const leftDate = parseDate(left); const rightDate = parseDate(right); if (leftDate && rightDate) return leftDate - rightDate; return String(left).localeCompare(String(right), undefined, { sensitivity: 'accent' }) }
+function conditionMatches(value, condition) { const text = normaliseText(value); const target = normaliseText(condition.value); const number = parseNumeric(value); const targetNumber = parseNumeric(condition.value); const valueDate = dateToIso(parseDate(value)); const targetDate = dateToIso(parseDate(condition.value)); switch (condition.op) { case 'contains': return text.includes(target); case 'startsWith': return text.startsWith(target); case 'endsWith': return text.endsWith(target); case 'isEmpty': return text === ''; case 'notEmpty': return text !== ''; case 'eq': return number !== null && targetNumber !== null ? number === targetNumber : text === target; case 'neq': return number !== null && targetNumber !== null ? number !== targetNumber : text !== target; case 'gt': return targetDate ? Boolean(valueDate && valueDate > targetDate) : Boolean(number !== null && targetNumber !== null && number > targetNumber); case 'gte': return targetDate ? Boolean(valueDate && valueDate >= targetDate) : Boolean(number !== null && targetNumber !== null && number >= targetNumber); case 'lt': return targetDate ? Boolean(valueDate && valueDate < targetDate) : Boolean(number !== null && targetNumber !== null && number < targetNumber); case 'lte': return targetDate ? Boolean(valueDate && valueDate <= targetDate) : Boolean(number !== null && targetNumber !== null && number <= targetNumber); default: return false } }
 
 export function createEngine(initialRows = 50, initialCols = 50) {
-    let rows = initialRows
-    let cols = initialCols
-    const cells = new Map()
-    const graph = createDependencyGraph()
-    const dirtyCells = new Set()
-    const computedCache = new Map()
-    const undoStack = []
-    const redoStack = []
-
-    // Internal generation counter — incremented on every structural mutation.
-    // Used by the cache to validate entries and by the engine to track state integrity.
-    let _generation = 0
-    let _batchMode = false
-    let _batchCallbacks = []
-
-    // ── Internal helpers ──
-
-    function cellKey(row, col) {
-        return indexToCellKey(row, col)
-    }
-
-    function cellCoords(key) {
-        return parseCellKey(key)
-    }
-
-    function isValidCellKey(key) {
-        const coords = cellCoords(key)
-        return coords && coords.row >= 0 && coords.row < rows && coords.col >= 0 && coords.col < cols
-    }
-
-    function updateDependencies(cell, rawFormula) {
-        // Extract all cell references from the formula
-        // Note: This includes references in ranges (e.g., A1:A5 includes A1, A2, A3, A4, A5)
-        // but the current implementation only tracks the range endpoints
-        for (const ref of extractCellReferences(rawFormula)) {
-            if (isValidCellKey(ref)) graph.addDependency(cell, ref)
-        }
-        // TODO: Consider tracking individual cells within ranges for more granular dependency tracking
-    }
-
-    function markCellDirty(cell) {
-        dirtyCells.add(cell)
-        for (const dependent of graph.getAllDependentsRecursive(cell)) {
-            dirtyCells.add(dependent)
-        }
-    }
-
-    function markAllCellsDirty() {
-        for (const key of cells.keys()) dirtyCells.add(key)
-    }
-
-    // ── Value resolution ──
-
-    function resolveCellValue(cellKey, visited = new Set()) {
-        if (visited.has(cellKey)) return '#CYCLE!'
-        visited.add(cellKey)
-
-        if (computedCache.has(cellKey)) {
-            const cached = computedCache.get(cellKey)
-            // Validate cache generation — stale entries from a previous generation are discarded
-            // Note: _generation is incremented on structural changes, but cache validation
-            // must account for cells that may have been invalidated by dependency changes
-            if (cached._gen === _generation && !dirtyCells.has(cellKey)) {
-                visited.delete(cellKey)
-                return cached.error || cached.computed
-            }
-            computedCache.delete(cellKey)
-        }
-
-        const cell = cells.get(cellKey)
-        if (!cell || !cell.raw) {
-            visited.delete(cellKey)
-            return ''
-        }
-
-        if (!cell.raw.startsWith('=')) {
-            const numericValue = parseFloat(cell.raw)
-            visited.delete(cellKey)
-            return isNaN(numericValue) ? cell.raw : numericValue
-        }
-
-        const result = evaluateFormula(cell.raw, (key) => resolveCellValue(key, visited))
-        visited.delete(cellKey)
-
-        if (result.error) {
-            computedCache.set(cellKey, { computed: null, error: result.error, _gen: _generation })
-            return result.error
-        }
-
-        computedCache.set(cellKey, { computed: result.value, error: null, _gen: _generation })
-        return result.value
-    }
-
-    // ── Recalculation ──
-
-    function recalculate() {
-        if (dirtyCells.size === 0) return
-
-        const affected = new Set(dirtyCells)
-        const sorted = graph.topologicalSort(affected)
-
-        // Process sorted cells first (topological order ensures dependencies are resolved)
-        for (const cell of sorted) {
-            if (dirtyCells.has(cell)) {
-                computedCache.delete(cell)
-                resolveCellValue(cell)
-            }
-        }
-        // Process any remaining affected cells that weren't in the sorted list
-        // (e.g., cells with no dependencies or circular dependencies)
-        for (const cell of affected) {
-            if (!sorted.includes(cell)) {
-                computedCache.delete(cell)
-                resolveCellValue(cell)
-            }
-        }
-
-        dirtyCells.clear()
-
-        // Notify batch listeners if in batch mode
-        // WARNING: Batch mode is currently unused but may be needed for future features
-        if (_batchMode) {
-            _batchCallbacks.forEach(cb => cb())
-        }
-    }
-
-    // ── Core cell operations ──
-
-    function setCellRaw(row, col, raw) {
-        const key = cellKey(row, col)
-        graph.removeAllDependencies(key)
-        computedCache.delete(key)
-
-        if (!raw || raw.trim() === '') {
-            cells.delete(key)
-            markCellDirty(key)
-            return
-        }
-
-        if (raw.startsWith('=')) {
-            cells.set(key, { raw, computed: null, error: null })
-            updateDependencies(key, raw)
-            if (graph.hasCycle(key)) {
-                graph.removeAllDependencies(key)
-                cells.set(key, { raw, computed: null, error: '#CYCLE!' })
-                markCellDirty(key)
-                return
-            }
-        } else {
-            cells.set(key, { raw, computed: null, error: null })
-        }
-
-        markCellDirty(key)
-    }
-
-    function getCellRaw(row, col) {
-        const key = cellKey(row, col)
-        const cell = cells.get(key)
-        if (!cell) return { raw: '', computed: null, error: null }
-        return { ...cell }
-    }
-
-    // ── Snapshot / Restore (for undo of structural changes) ──
-
-    function takeSnapshot() {
-        // Create a deep copy of all cell data for undo/redo operations
-        // Note: This only captures cell data, not the dependency graph or cache
-        // The dependency graph is rebuilt from the cell formulas when restoring
-        const snapshot = new Map()
-        for (const [key, value] of cells.entries()) {
-            // Create a shallow copy of the cell object
-            // The cell object contains: { raw: string, computed: number|null, error: string|null }
-            // Note: computed and error are not persisted in snapshots - they're recalculated on restore
-            snapshot.set(key, { ...value })
-        }
-        return snapshot
-    }
-
-    function restoreSnapshot(snapshot) {
-        cells.clear()
-        for (const [key, value] of snapshot.entries()) {
-            cells.set(key, { ...value })
-        }
-        graph.clear()
-        computedCache.clear()
-        dirtyCells.clear()
-        _generation++
-        // Rebuild dependency graph from restored cells
-        // Important: This must happen before marking cells dirty to ensure correct dependency tracking
-        for (const [key, value] of cells.entries()) {
-            if (value.raw && value.raw.startsWith('=')) updateDependencies(key, value.raw)
-        }
-        markAllCellsDirty()
-    }
-
-    // ── Row / Column structural operations ──
-
-    function performInsertRow(atIndex) {
-        const snapshot = takeSnapshot()
-        cells.clear()
-        graph.clear()
-        computedCache.clear()
-        dirtyCells.clear()
-        _generation++
-
-        for (const [key, value] of snapshot.entries()) {
-            const coords = cellCoords(key)
-            if (!coords) continue
-            if (coords.row >= atIndex) {
-                const newKey = cellKey(coords.row + 1, coords.col)
-                cells.set(newKey, { ...value, raw: shiftCellReferences(value.raw, 1, 0, atIndex) })
-            } else {
-                cells.set(key, { ...value, raw: shiftCellReferences(value.raw, 1, 0, atIndex) })
-            }
-        }
-        rows++
-        for (const [key, value] of cells.entries()) {
-            if (value.raw.startsWith('=')) updateDependencies(key, value.raw)
-        }
-        markAllCellsDirty()
-    }
-
-    function performDeleteRow(atIndex) {
-        const snapshot = takeSnapshot()
-        cells.clear()
-        graph.clear()
-        computedCache.clear()
-        dirtyCells.clear()
-        _generation++
-
-        for (const [key, value] of snapshot.entries()) {
-            const coords = cellCoords(key)
-            if (!coords) continue
-            if (coords.row === atIndex) continue
-            if (coords.row > atIndex) {
-                const newKey = cellKey(coords.row - 1, coords.col)
-                cells.set(newKey, { ...value, raw: shiftCellReferences(value.raw, -1, 0, atIndex) })
-            } else {
-                cells.set(key, { ...value, raw: shiftCellReferences(value.raw, -1, 0, atIndex) })
-            }
-        }
-        rows--
-        for (const [key, value] of cells.entries()) {
-            if (value.raw.startsWith('=')) updateDependencies(key, value.raw)
-        }
-        markAllCellsDirty()
-    }
-
-    function performInsertColumn(atIndex) {
-        const snapshot = takeSnapshot()
-        cells.clear()
-        graph.clear()
-        computedCache.clear()
-        dirtyCells.clear()
-        _generation++
-
-        for (const [key, value] of snapshot.entries()) {
-            const coords = cellCoords(key)
-            if (!coords) continue
-            if (coords.col >= atIndex) {
-                const newKey = cellKey(coords.row, coords.col + 1)
-                cells.set(newKey, { ...value, raw: shiftCellReferences(value.raw, 0, 1, atIndex, true) })
-            } else {
-                cells.set(key, { ...value, raw: shiftCellReferences(value.raw, 0, 1, atIndex, true) })
-            }
-        }
-        cols++
-        for (const [key, value] of cells.entries()) {
-            if (value.raw.startsWith('=')) updateDependencies(key, value.raw)
-        }
-        markAllCellsDirty()
-    }
-
-    function performDeleteColumn(atIndex) {
-        const snapshot = takeSnapshot()
-        cells.clear()
-        graph.clear()
-        computedCache.clear()
-        dirtyCells.clear()
-        _generation++
-
-        for (const [key, value] of snapshot.entries()) {
-            const coords = cellCoords(key)
-            if (!coords) continue
-            if (coords.col === atIndex) continue
-            if (coords.col > atIndex) {
-                const newKey = cellKey(coords.row, coords.col - 1)
-                cells.set(newKey, { ...value, raw: shiftCellReferences(value.raw, 0, -1, atIndex, true) })
-            } else {
-                cells.set(key, { ...value, raw: shiftCellReferences(value.raw, 0, -1, atIndex, true) })
-            }
-        }
-        cols--
-        for (const [key, value] of cells.entries()) {
-            if (value.raw.startsWith('=')) updateDependencies(key, value.raw)
-        }
-        markAllCellsDirty()
-    }
-
-    // ── Undo / Redo ──
-
-    function pushToUndoStack(entry) {
-        undoStack.push({ ...entry, _gen: _generation })
-        if (undoStack.length > MAX_UNDO_HISTORY) undoStack.shift()
-        redoStack.length = 0
-    }
-
-    function executeSetCell(row, col, value) {
-        const previousValue = getCellRaw(row, col).raw
-        // Only create undo entry if value actually changed
-        // This prevents undo stack pollution with no-op edits
-        if (previousValue !== value) {
-            pushToUndoStack({ type: 'set', r: row, c: col, oldVal: previousValue, newVal: value })
-        }
-        setCellRaw(row, col, value)
-        _generation++
-        recalculate()
-    }
-
-    function executeInsertRow(atIndex) {
-        const snapshot = takeSnapshot()
-        const previousRows = rows
-        pushToUndoStack({ type: 'rowins', snap: snapshot, oldRows: previousRows })
-        performInsertRow(atIndex)
-        recalculate()
-    }
-
-    function executeDeleteRow(atIndex) {
-        const snapshot = takeSnapshot()
-        const previousRows = rows
-        pushToUndoStack({ type: 'rowdel', snap: snapshot, oldRows: previousRows })
-        performDeleteRow(atIndex)
-        recalculate()
-    }
-
-    function executeInsertColumn(atIndex) {
-        const snapshot = takeSnapshot()
-        const previousCols = cols
-        pushToUndoStack({ type: 'colins', snap: snapshot, oldCols: previousCols })
-        performInsertColumn(atIndex)
-        recalculate()
-    }
-
-    function executeDeleteColumn(atIndex) {
-        const snapshot = takeSnapshot()
-        const previousCols = cols
-        pushToUndoStack({ type: 'coldel', snap: snapshot, oldCols: previousCols })
-        performDeleteColumn(atIndex)
-        recalculate()
-    }
-
-    function undo() {
-        if (undoStack.length === 0) return false
-        const entry = undoStack.pop()
-
-        if (entry.type === 'set') {
-            // For cell edits, swap current value to redo stack and restore old value
-            const currentValue = getCellRaw(entry.r, entry.c).raw
-            redoStack.push({ ...entry, newVal: currentValue })
-            setCellRaw(entry.r, entry.c, entry.oldVal)
-            _generation++
-            recalculate()
-        } else {
-            // For structural changes (row/col insert/delete), save current state to redo
-            // and restore the snapshot from undo entry
-            // Note: The snapshot contains the cell data, but rows/cols must be restored separately
-            redoStack.push({
-                ...entry,
-                restoreSnap: takeSnapshot(),
-                restoreRows: rows,
-                restoreCols: cols
-            })
-            restoreSnapshot(entry.snap)
-            // Restore grid dimensions - this must happen after restoreSnapshot
-            // because restoreSnapshot increments _generation but doesn't modify rows/cols
-            if (entry.type === 'rowins' || entry.type === 'rowdel') rows = entry.oldRows
-            else if (entry.type === 'colins' || entry.type === 'coldel') cols = entry.oldCols
-            recalculate()
-        }
-        return true
-    }
-
-    function redo() {
-        if (redoStack.length === 0) return false
-        const entry = redoStack.pop()
-
-        if (entry.type === 'set') {
-            const currentValue = getCellRaw(entry.r, entry.c).raw
-            undoStack.push({ ...entry, oldVal: currentValue })
-            setCellRaw(entry.r, entry.c, entry.newVal)
-            _generation++
-            recalculate()
-        } else {
-            undoStack.push({
-                ...entry,
-                snap: takeSnapshot(),
-                oldRows: rows,
-                oldCols: cols
-            })
-            restoreSnapshot(entry.restoreSnap)
-            rows = entry.restoreRows
-            cols = entry.restoreCols
-            recalculate()
-        }
-        return true
-    }
-
-    // ── Public cell display (returns raw + computed + error) ──
-
-    function getCellForDisplay(row, col) {
-        const cell = getCellRaw(row, col)
-        const key = cellKey(row, col)
-        // Resolve the computed value (this may trigger recalculation if the cell is dirty)
-        // The resolveCellValue function handles caching and dependency resolution
-        const value = resolveCellValue(key)
-
-        // Error values are strings starting with '#' (e.g., '#CYCLE!', '#VALUE!')
-        if (typeof value === 'string' && value.startsWith('#')) {
-            return { raw: cell.raw, computed: null, error: value }
-        }
-        // Return the computed value (which may be a number or string)
-        // Note: Empty cells return '' as computed value, not null
-        return { raw: cell.raw, computed: value, error: null }
-    }
-
-    // ── Public API ──
-    // The engine exposes a limited API to prevent direct access to internal state
-    // All cell operations go through the public methods which handle undo/redo,
-    // dependency tracking, and cache invalidation automatically
-
-    return {
-        get rows() { return rows },
-        get cols() { return cols },
-        getCell: getCellForDisplay,
-        setCell: executeSetCell,
-        insertRow: executeInsertRow,
-        deleteRow: executeDeleteRow,
-        insertColumn: executeInsertColumn,
-        deleteColumn: executeDeleteColumn,
-        undo,
-        redo,
-        canUndo: () => undoStack.length > 0,
-        canRedo: () => redoStack.length > 0,
-        // Grow the grid so that at least minRows x minCols exist. The engine is
-        // sparse, so this only moves the bounds; nothing is allocated.
-        ensureCapacity: (minRows, minCols) => {
-            if (minRows > rows) rows = minRows
-            if (minCols > cols) cols = minCols
-        },
-        // Internal state is not exposed - if you need to serialize/deserialize,
-        // you'll need to work with the public API or add new methods
-    }
+  let rows = Math.max(1, initialRows); let cols = Math.max(1, initialCols)
+  let cells = new Map(); let styles = new Map(); let rowIds = Array.from({ length: rows }, (_, index) => index); let columnIds = Array.from({ length: cols }, (_, index) => index); let nextRowId = rows; let nextColumnId = cols
+  let rowHeights = Array(rows).fill(DEFAULT_ROW_HEIGHT); let columnWidths = Array(cols).fill(DEFAULT_COLUMN_WIDTH); let frozenRows = 1; let filters = new Map(); let undoStack = []; let redoStack = []
+  const keyFor = (row, col) => indexToCellKey(row, col); const inBounds = point => point.row >= 0 && point.row < rows && point.col >= 0 && point.col < cols
+  function captureState() { return { rows, cols, cells: cloneMap(cells), styles: cloneMap(styles), rowIds: [...rowIds], columnIds: [...columnIds], nextRowId, nextColumnId, rowHeights: [...rowHeights], columnWidths: [...columnWidths], frozenRows, filters: cloneFilters(filters) } }
+  function restoreState(state) { rows = state.rows; cols = state.cols; cells = cloneMap(state.cells); styles = cloneMap(state.styles); rowIds = [...state.rowIds]; columnIds = [...state.columnIds]; nextRowId = state.nextRowId; nextColumnId = state.nextColumnId; rowHeights = [...state.rowHeights]; columnWidths = [...state.columnWidths]; frozenRows = state.frozenRows; filters = cloneFilters(state.filters) }
+  function transact(type, operation) { const before = captureState(); const result = operation(); const after = captureState(); undoStack.push({ type, before, after }); if (undoStack.length > MAX_UNDO_HISTORY) undoStack.shift(); redoStack = []; return result }
+  function ensureCapacity(minRows, minCols) { while (rows < minRows) { rowIds.push(nextRowId++); rowHeights.push(DEFAULT_ROW_HEIGHT); rows += 1 } while (cols < minCols) { columnIds.push(nextColumnId++); columnWidths.push(DEFAULT_COLUMN_WIDTH); cols += 1 } }
+  function getRawCell(row, col) { return cells.get(keyFor(row, col))?.raw ?? '' }
+  function setRawCell(row, col, value) { if (row < 0 || col < 0) return; ensureCapacity(row + 1, col + 1); const raw = String(value ?? ''); if (!raw.trim()) cells.delete(keyFor(row, col)); else cells.set(keyFor(row, col), { raw }) }
+  function evaluateCell(row, col, visiting = new Set()) { if (!inBounds({ row, col })) return { raw: '', computed: null, error: '#REF!' }; const key = keyFor(row, col); const raw = getRawCell(row, col); if (!raw) return { raw: '', computed: '', error: null }; if (!raw.startsWith('=')) { const numeric = parseNumeric(raw); return { raw, computed: numeric === null ? raw : numeric, error: null } } if (visiting.has(key)) return { raw, computed: null, error: '#CYCLE!' }; visiting.add(key); try { const ast = parseFormula(raw.slice(1)); const computed = evaluateAst(ast, reference => { const point = parseCellKey(reference); if (!point || !inBounds(point)) throw new Error('REF'); const cell = evaluateCell(point.row, point.col, visiting); if (cell.error) throw new Error(cell.error === '#CYCLE!' ? 'CYCLE' : 'VALUE'); return cell.computed }); visiting.delete(key); return { raw, computed, error: null } } catch (error) { visiting.delete(key); return { raw, computed: null, error: formulaError(error) } } }
+  function getStyle(row, col) { return { ...DEFAULT_STYLE, ...(styles.get(keyFor(row, col)) ?? {}) } }
+  function setStyle(row, col, patch) { styles.set(keyFor(row, col), { ...getStyle(row, col), ...patch }) }
+  function getUsedRange() { if (!cells.size) return { startRow: 0, endRow: 0, startCol: 0, endCol: 0, rowCount: 1, colCount: 1 }; let startRow = Infinity; let endRow = 0; let startCol = Infinity; let endCol = 0; for (const key of cells.keys()) { const point = parseCellKey(key); if (!point) continue; startRow = Math.min(startRow, point.row); endRow = Math.max(endRow, point.row); startCol = Math.min(startCol, point.col); endCol = Math.max(endCol, point.col) } return { startRow, endRow, startCol, endCol, rowCount: endRow - startRow + 1, colCount: endCol - startCol + 1 } }
+  function setCell(row, col, value) { return transact('setCell', () => setRawCell(row, col, value)) }
+  function loadMatrix(matrix, origin = { row: 0, col: 0 }) { const startRow = origin.row ?? origin.r ?? 0; const startCol = origin.col ?? origin.c ?? 0; return transact('loadMatrix', () => { const width = Math.max(1, ...matrix.map(row => row.length)); ensureCapacity(startRow + matrix.length, startCol + width); for (let row = 0; row < matrix.length; row += 1) for (let col = 0; col < matrix[row].length; col += 1) setRawCell(startRow + row, startCol + col, matrix[row][col]) }) }
+  function setRange(range, values, options = {}) { const target = normaliseRange(range); return transact('setRange', () => { ensureCapacity(target.endRow + 1, target.endCol + 1); for (let row = target.startRow; row <= target.endRow; row += 1) for (let col = target.startCol; col <= target.endCol; col += 1) { setRawCell(row, col, Array.isArray(values) ? values[row - target.startRow]?.[col - target.startCol] ?? '' : values); if (options.style) setStyle(row, col, options.style) } }) }
+  function clearRange(range) { const target = normaliseRange(range); return transact('clearRange', () => { for (let row = target.startRow; row <= target.endRow; row += 1) for (let col = target.startCol; col <= target.endCol; col += 1) setRawCell(row, col, '') }) }
+  function fillRange(seedRange, targetRange) { const seed = normaliseRange(seedRange); const target = normaliseRange(targetRange); return transact('fillRange', () => { ensureCapacity(target.endRow + 1, target.endCol + 1); const seedHeight = seed.endRow - seed.startRow + 1; const seedWidth = seed.endCol - seed.startCol + 1; const vertical = target.endRow - target.startRow >= target.endCol - target.startCol; for (let row = target.startRow; row <= target.endRow; row += 1) for (let col = target.startCol; col <= target.endCol; col += 1) { if (row >= seed.startRow && row <= seed.endRow && col >= seed.startCol && col <= seed.endCol) continue; const sourceRow = seed.startRow + ((row - seed.startRow) % seedHeight + seedHeight) % seedHeight; const sourceCol = seed.startCol + ((col - seed.startCol) % seedWidth + seedWidth) % seedWidth; const values = vertical ? Array.from({ length: seedHeight }, (_, offset) => ({ raw: getRawCell(seed.startRow + offset, sourceCol) })) : Array.from({ length: seedWidth }, (_, offset) => ({ raw: getRawCell(sourceRow, seed.startCol + offset) })); const position = vertical ? row - seed.startRow : col - seed.startCol; const first = values[0]; let raw; if (first.raw.startsWith('=')) raw = shiftFormulaForFill(first.raw, row - sourceRow, col - sourceCol); else { const series = parseSeriesValue(first.raw); if (values.length > 1) { const second = parseSeriesValue(values[1].raw); if (series.kind === second.kind && ['number', 'suffix', 'date'].includes(series.kind)) series.step = series.kind === 'date' ? Math.round((second.value - series.value) / 86400000) : second.value - series.value } if (series.kind === 'number' || series.kind === 'suffix') series.step ??= 1; raw = seriesValue(series, position) } setRawCell(row, col, raw); setStyle(row, col, getStyle(sourceRow, sourceCol)) } }) }
+  function moveStructures(type, atIndex) { const movedCells = new Map(); const movedStyles = new Map(); for (const [key, cell] of cells.entries()) { const point = parseCellKey(key); if (!point || (type === 'deleteRow' && point.row === atIndex) || (type === 'deleteColumn' && point.col === atIndex)) continue; const next = { ...point }; if (type === 'insertRow' && next.row >= atIndex) next.row += 1; if (type === 'deleteRow' && next.row > atIndex) next.row -= 1; if (type === 'insertColumn' && next.col >= atIndex) next.col += 1; if (type === 'deleteColumn' && next.col > atIndex) next.col -= 1; movedCells.set(keyFor(next.row, next.col), { raw: shiftFormulaForStructure(cell.raw, type, atIndex) }) } for (const [key, style] of styles.entries()) { const point = parseCellKey(key); if (!point || (type === 'deleteRow' && point.row === atIndex) || (type === 'deleteColumn' && point.col === atIndex)) continue; const next = { ...point }; if (type === 'insertRow' && next.row >= atIndex) next.row += 1; if (type === 'deleteRow' && next.row > atIndex) next.row -= 1; if (type === 'insertColumn' && next.col >= atIndex) next.col += 1; if (type === 'deleteColumn' && next.col > atIndex) next.col -= 1; movedStyles.set(keyFor(next.row, next.col), { ...style }) } cells = movedCells; styles = movedStyles }
+  function insertRow(atIndex) { return transact('insertRow', () => { const index = Math.max(0, Math.min(rows, atIndex)); moveStructures('insertRow', index); rowIds.splice(index, 0, nextRowId++); rowHeights.splice(index, 0, DEFAULT_ROW_HEIGHT); rows += 1 }) }
+  function deleteRow(atIndex) { if (rows <= 1) return false; return transact('deleteRow', () => { const index = Math.max(0, Math.min(rows - 1, atIndex)); moveStructures('deleteRow', index); rowIds.splice(index, 1); rowHeights.splice(index, 1); rows -= 1 }) }
+  function insertColumn(atIndex) { return transact('insertColumn', () => { const index = Math.max(0, Math.min(cols, atIndex)); moveStructures('insertColumn', index); columnIds.splice(index, 0, nextColumnId++); columnWidths.splice(index, 0, DEFAULT_COLUMN_WIDTH); cols += 1 }) }
+  function deleteColumn(atIndex) { if (cols <= 1) return false; return transact('deleteColumn', () => { const index = Math.max(0, Math.min(cols - 1, atIndex)); moveStructures('deleteColumn', index); columnIds.splice(index, 1); columnWidths.splice(index, 1); cols -= 1 }) }
+  function setRangeStyle(range, patch) { const target = normaliseRange(range); return transact('setRangeStyle', () => { for (let row = target.startRow; row <= target.endRow; row += 1) for (let col = target.startCol; col <= target.endCol; col += 1) setStyle(row, col, patch) }) }
+  function setFilter(column, definition) { filters.set(column, { values: definition.values ? [...definition.values] : null, conditions: (definition.conditions ?? []).map(condition => ({ ...condition })) }) }
+  function clearFilter(column) { filters.delete(column) }
+  function clearAllFilters() { filters.clear() }
+  function rowPassesFilters(row) { for (const [column, definition] of filters.entries()) { const cell = evaluateCell(row, column); const value = cell.error ?? cell.computed; if (definition.values?.length && !definition.values.map(normaliseText).includes(normaliseText(value))) return false; if (!(definition.conditions ?? []).every(condition => conditionMatches(value, condition))) return false } return true }
+  function getVisibleRows(startRow = 1, endRow = getUsedRange().endRow) { const result = []; for (let row = Math.max(0, startRow); row <= Math.min(rows - 1, endRow); row += 1) if (rowPassesFilters(row)) result.push(row); return result }
+  function reorderRows(destinations, sources, startCol, endCol) { const copied = new Map(); const copiedStyles = new Map(); const sourceIds = sources.map(row => rowIds[row]); for (let index = 0; index < destinations.length; index += 1) { const destination = destinations[index]; const source = sources[index]; for (let col = startCol; col <= endCol; col += 1) { const raw = getRawCell(source, col); copied.set(keyFor(destination, col), { raw: raw.startsWith('=') ? shiftFormulaForFill(raw, destination - source, 0) : raw }); copiedStyles.set(keyFor(destination, col), getStyle(source, col)) } } for (const destination of destinations) for (let col = startCol; col <= endCol; col += 1) { const key = keyFor(destination, col); const cell = copied.get(key); if (cell?.raw) cells.set(key, cell); else cells.delete(key); styles.set(key, copiedStyles.get(key)) } for (let index = 0; index < destinations.length; index += 1) rowIds[destinations[index]] = sourceIds[index] }
+  function sortRange(request = {}) { const used = getUsedRange(); const startRow = request.startRow ?? used.startRow; const endRow = request.endRow ?? used.endRow; const startCol = request.startCol ?? used.startCol; const endCol = request.endCol ?? used.endCol; const column = request.column ?? startCol; const direction = request.direction ?? 'asc'; const header = request.header ?? startRow; const totalRow = request.totalRow ?? (looksLikeTotal(getRawCell(endRow, startCol)) ? endRow : null); const candidates = Array.from({ length: Math.max(0, endRow - header - (totalRow === endRow ? 1 : 0)) }, (_, index) => header + 1 + index); const destinations = filters.size ? candidates.filter(rowPassesFilters) : candidates; const sources = direction === 'original' ? [...destinations].sort((left, right) => rowIds[left] - rowIds[right]) : [...destinations].sort((left, right) => { const comparison = compareValues(evaluateCell(left, column).computed, evaluateCell(right, column).computed); return direction === 'desc' ? -comparison : comparison }); return transact('sortRange', () => reorderRows(destinations, sources, startCol, endCol)) }
+  function setColumnWidth(column, width) { const bounded = Math.max(30, Math.min(600, Number(width) || DEFAULT_COLUMN_WIDTH)); return transact('setColumnWidth', () => { columnWidths[column] = bounded }) }
+  function setRowHeight(row, height) { const bounded = Math.max(16, Math.min(240, Number(height) || DEFAULT_ROW_HEIGHT)); return transact('setRowHeight', () => { rowHeights[row] = bounded }) }
+  function autoFitColumns(columnsToFit = Array.from({ length: cols }, (_, index) => index)) { return transact('autoFitColumns', () => { const used = getUsedRange(); for (const column of columnsToFit) { let width = 30; for (let row = used.startRow; row <= used.endRow; row += 1) width = Math.max(width, Math.min(600, formatCellValue(evaluateCell(row, column).computed, getStyle(row, column)).length * 8 + 18)); columnWidths[column] = width } }) }
+  function setFrozenRows(count) { if (count < 0 || count >= rows) return { error: 'OUT_OF_RANGE' }; return transact('setFrozenRows', () => { frozenRows = count }) }
+  function applyFormat(plan) { const used = getUsedRange(); if (typeof plan.freezeRows === 'number' && plan.freezeRows >= used.rowCount) return { error: 'OUT_OF_RANGE' }; const before = captureState(); if (plan.clearFormatting) styles = new Map(); const bodyStart = Math.min(used.endRow + 1, used.startRow + 1); const totalRow = looksLikeTotal(getRawCell(used.endRow, used.startCol)) ? used.endRow : null; const apply = (range, style) => { if (!style) return; for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) setStyle(row, col, style) }; apply({ startRow: bodyStart, endRow: used.endRow, startCol: used.startCol, endCol: used.endCol }, plan.bodyStyle); for (const entry of plan.columns ?? []) if (entry.col >= used.startCol && entry.col <= used.endCol) apply({ startRow: bodyStart, endRow: used.endRow, startCol: entry.col, endCol: entry.col }, entry.style); if (totalRow !== null) apply({ startRow: totalRow, endRow: totalRow, startCol: used.startCol, endCol: used.endCol }, plan.totalsStyle); apply({ startRow: used.startRow, endRow: used.startRow, startCol: used.startCol, endCol: used.endCol }, plan.headerStyle); for (const entry of plan.columnWidths ?? []) if (entry.col >= 0 && entry.col < cols && entry.width >= 30 && entry.width <= 600) columnWidths[entry.col] = entry.width; if (typeof plan.freezeRows === 'number') frozenRows = plan.freezeRows; if (plan.autoFitColumns) { for (let col = used.startCol; col <= used.endCol; col += 1) { let width = 30; for (let row = used.startRow; row <= used.endRow; row += 1) width = Math.max(width, Math.min(600, formatCellValue(evaluateCell(row, col).computed, getStyle(row, col)).length * 8 + 18)); columnWidths[col] = width } } const after = captureState(); if (stateJSON(before) === stateJSON(after)) return { result: 'NO_CHANGES' }; undoStack.push({ type: 'applyFormat', before, after }); if (undoStack.length > MAX_UNDO_HISTORY) undoStack.shift(); redoStack = []; return { result: 'APPLIED' } }
+  function getTableSnapshot() { const used = getUsedRange(); const headers = []; const values = []; const queryValue = (row, col) => { const raw = getRawCell(row, col); return raw.startsWith('=') ? evaluateCell(row, col).computed : raw }; for (let col = used.startCol; col <= used.endCol; col += 1) headers.push(String(queryValue(used.startRow, col) ?? '')); for (let row = used.startRow + 1; row <= used.endRow; row += 1) values.push(Array.from({ length: used.colCount }, (_, offset) => queryValue(row, used.startCol + offset))); return { used, headers, values } }
+  function insertTable(at, table) { const point = typeof at === 'string' ? parseCellKey(at) : { row: at.row ?? at.r, col: at.col ?? at.c }; return setRange({ start: point, end: { row: point.row + table.rows.length, col: point.col + table.columns.length - 1 } }, [table.columns, ...table.rows]) }
+  function undo() { const entry = undoStack.pop(); if (!entry) return false; redoStack.push(entry); restoreState(entry.before); return true }
+  function redo() { const entry = redoStack.pop(); if (!entry) return false; undoStack.push(entry); restoreState(entry.after); return true }
+  return { get rows() { return rows }, get cols() { return cols }, get frozenRows() { return frozenRows }, getCell: evaluateCell, getDisplayCell(row, col) { const cell = evaluateCell(row, col); const style = getStyle(row, col); return { ...cell, style, display: cell.error ?? formatCellValue(cell.computed, style) } }, getStyle, getUsedRange, getVisibleRows, getTableSnapshot, get rowHeights() { return rowHeights }, get columnWidths() { return columnWidths }, getColumnWidth: column => columnWidths[column] ?? DEFAULT_COLUMN_WIDTH, getRowHeight: row => rowHeights[row] ?? DEFAULT_ROW_HEIGHT, setCell, setRange, loadMatrix, clearRange, fillRange, setRangeStyle, insertRow, deleteRow, insertColumn, deleteColumn, ensureCapacity, setFilter, clearFilter, clearAllFilters, sortRange, setColumnWidth, setRowHeight, autoFitColumns, setFrozenRows, applyFormat, insertTable, undo, redo, canUndo: () => undoStack.length > 0, canRedo: () => redoStack.length > 0 }
 }

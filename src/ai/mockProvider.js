@@ -34,7 +34,14 @@ export function createMockProvider() {
         name: 'mock',
         async complete({ user }) {
             await new Promise(resolve => setTimeout(resolve, 150)) // pretend to be a network call
-            const hit = TABLE.get(normalize(user))
+            let prompt = user
+            try {
+                const envelope = JSON.parse(user)
+                prompt = envelope.prompt ?? user
+            } catch {
+                // Direct prompt strings stay supported for the fixture tests.
+            }
+            const hit = TABLE.get(normalize(prompt))
             if (hit) return { text: wrap(hit), provider: 'mock' }
             return {
                 text: wrap({

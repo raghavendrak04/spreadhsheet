@@ -1,446 +1,352 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { createEngine } from './engine/core.js'
-import { loadSampleSmall, loadSampleLarge } from './fixtures/loadSample.js'
+import { createEngine, indexToCellKey, indexToColumnLetter, normaliseRange, parseCellKey, rangeToA1 } from './engine/core.js'
+import { loadSampleLarge, loadSampleSmall } from './fixtures/loadSample.js'
+import { createProvider } from './ai/provider.js'
+import { buildSheetContext, buildSystemPrompt } from './ai/context.js'
+import { parseAndValidateAction } from './ai/response.js'
+import { executeQuery } from './ai/queryExecutor.js'
+import { applyFormat, previewFormat } from './ai/formatApplier.js'
 
-const TOTAL_ROWS = 50
-const TOTAL_COLS = 50
+const ROW_HEADER = 52
+const COLUMN_HEADER = 28
+const OVERSCAN = 4
+
+function lowerBound(values, target) {
+  let left = 0
+  let right = values.length - 1
+  while (left < right) {
+    const middle = Math.floor((left + right) / 2)
+    if (values[middle] < target) left = middle + 1
+    else right = middle
+  }
+  return Math.max(0, left - 1)
+}
+
+function prefixSums(values) {
+  const result = [0]
+  for (const value of values) result.push(result[result.length - 1] + value)
+  return result
+}
+
+function within(range, row, col) {
+  const value = normaliseRange(range)
+  return row >= value.startRow && row <= value.endRow && col >= value.startCol && col <= value.endCol
+}
+
+function samePoint(left, right) {
+  return left && right && left.row === right.row && left.col === right.col
+}
+
+function cellCss(style) {
+  return {
+    background: style.bg,
+    color: style.color,
+    fontWeight: style.bold ? 700 : 400,
+    fontStyle: style.italic ? 'italic' : 'normal',
+    textDecoration: style.underline ? 'underline' : 'none',
+    textAlign: style.align,
+    fontSize: style.fontSize,
+  }
+}
 
 export default function App() {
-  // Engine instance is created once and reused across renders
-  // Note: The engine maintains its own internal state, so React state is only used for UI updates
-  const [engine] = useState(() => createEngine(TOTAL_ROWS, TOTAL_COLS))
+  const [engine] = useState(() => createEngine(100000, 200))
   const [, setVersion] = useState(0)
-  const [selectedCell, setSelectedCell] = useState(null)
-  const [editingCell, setEditingCell] = useState(null)
+  const [selection, setSelection] = useState({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+  const [editing, setEditing] = useState(null)
   const [editValue, setEditValue] = useState('')
-  // Cell styles are stored separately from engine data
-  // Format: { "row,col": { bold: bool, italic: bool, ... } }
-  const [cellStyles, setCellStyles] = useState({})
-  const cellInputRef = useRef(null)
+  const [viewport, setViewport] = useState({ left: 0, top: 0, width: 900, height: 600 })
+  const [fillPreview, setFillPreview] = useState(null)
+  const [filterMenu, setFilterMenu] = useState(null)
+  const [filterOp, setFilterOp] = useState('contains')
+  const [filterValue, setFilterValue] = useState('')
+  const [filterSearch, setFilterSearch] = useState('')
+  const [filterValues, setFilterValues] = useState([])
+  const [sortState, setSortState] = useState(null)
+  const [nameBox, setNameBox] = useState('A1')
+  const [aiOpen, setAiOpen] = useState(false)
+  const [aiPrompt, setAiPrompt] = useState('')
+  const [aiHistory, setAiHistory] = useState([])
+  const [aiPending, setAiPending] = useState(null)
+  const [showPlan, setShowPlan] = useState(false)
+  const [destination, setDestination] = useState('M2')
+  const scrollRef = useRef(null)
+  const inputRef = useRef(null)
+  const dragRef = useRef({ active: false, filling: false, resize: null })
 
-  const forceRerender = useCallback(() => setVersion(v => v + 1), [])
+  const refresh = useCallback(() => setVersion(version => version + 1), [])
+  const selectedRange = useMemo(() => normaliseRange(selection), [selection])
+  // The engine keeps dimensions outside React state; an explicit refresh triggers
+  // rendering after each mutation, at which point these inexpensive prefix sums update.
+  const columnOffsets = prefixSums(engine.columnWidths)
+  const rowOffsets = prefixSums(engine.rowHeights)
 
-  // ────── Cell style helpers ──────
+  const visible = useMemo(() => {
+    const startRow = Math.max(0, lowerBound(rowOffsets, viewport.top) - OVERSCAN)
+    const endRow = Math.min(engine.rows - 1, lowerBound(rowOffsets, viewport.top + viewport.height) + OVERSCAN + 1)
+    const startCol = Math.max(0, lowerBound(columnOffsets, viewport.left) - OVERSCAN)
+    const endCol = Math.min(engine.cols - 1, lowerBound(columnOffsets, viewport.left + viewport.width) + OVERSCAN + 1)
+    return { startRow, endRow, startCol, endCol }
+  }, [columnOffsets, engine.cols, engine.rows, rowOffsets, viewport])
 
-  const getCellStyle = useCallback((row, col) => {
-    const key = `${row},${col}`
-    return cellStyles[key] || {
-      bold: false, italic: false, underline: false,
-      bg: 'white', color: '#202124', align: 'left', fontSize: 13
+  const rangeStyle = engine.getStyle(selectedRange.startRow, selectedRange.startCol)
+  const selectedCell = engine.getDisplayCell(selection.focus.row, selection.focus.col)
+  const used = engine.getUsedRange()
+  const visibleRows = engine.getVisibleRows(used.startRow + 1, used.endRow)
+  const collectDistinctFilterValues = useCallback(column => {
+    const values = new Map()
+    for (let row = used.startRow + 1; row <= used.endRow; row += 1) {
+      const display = String(engine.getCell(row, column).computed ?? '')
+      const key = display.trim().toLowerCase()
+      if (!values.has(key)) values.set(key, display)
     }
-  }, [cellStyles])
+    return Array.from(values.values()).sort((left, right) => left.localeCompare(right))
+  }, [engine, used.endRow, used.startRow])
+  const distinctFilterValues = useMemo(() => filterMenu === null ? [] : collectDistinctFilterValues(filterMenu), [collectDistinctFilterValues, filterMenu])
 
-  const updateCellStyle = useCallback((row, col, updates) => {
-    const key = `${row},${col}`
-    setCellStyles(prev => ({
-      ...prev,
-      [key]: { ...getCellStyle(row, col), ...updates }
-    }))
-  }, [getCellStyle])
+  const scrollToCell = useCallback((row, col) => {
+    const scroll = scrollRef.current
+    if (!scroll) return
+    scroll.scrollTo({ left: Math.max(0, columnOffsets[col] - 80), top: Math.max(0, rowOffsets[row] - 60), behavior: 'auto' })
+  }, [columnOffsets, rowOffsets])
 
-  // ────── Cell editing ──────
-
-  const startEditing = useCallback((row, col) => {
-    setSelectedCell({ r: row, c: col })
-    setEditingCell({ r: row, c: col })
-    const cellData = engine.getCell(row, col)
-    setEditValue(cellData.raw)
-    setTimeout(() => cellInputRef.current?.focus(), 0)
+  const beginEdit = useCallback((point, seed = null) => {
+    const cell = engine.getCell(point.row, point.col)
+    setEditing(point)
+    setEditValue(seed ?? cell.raw)
+    setSelection({ anchor: point, focus: point })
+    requestAnimationFrame(() => inputRef.current?.focus())
   }, [engine])
 
-  const commitEdit = useCallback((row, col) => {
-    // Only commit if the value actually changed to avoid unnecessary recalculations
-    const currentCell = engine.getCell(row, col)
-    if (currentCell.raw !== editValue) {
-      engine.setCell(row, col, editValue)
-      forceRerender()
-    }
-    setEditingCell(null)
-  }, [engine, editValue, forceRerender])
+  const commitEdit = useCallback(() => {
+    if (!editing) return
+    engine.setCell(editing.row, editing.col, editValue)
+    setEditing(null)
+    refresh()
+  }, [editing, editValue, engine, refresh])
 
-  const handleCellClick = useCallback((row, col) => {
-    if (editingCell && (editingCell.r !== row || editingCell.c !== col)) {
-      commitEdit(editingCell.r, editingCell.c)
-    }
-    if (!editingCell || editingCell.r !== row || editingCell.c !== col) {
-      startEditing(row, col)
-    }
-  }, [editingCell, commitEdit, startEditing])
+  const selectCell = useCallback((point, extend = false) => {
+    if (editing && !samePoint(editing, point)) commitEdit()
+    setSelection(previous => extend ? { anchor: previous.anchor, focus: point } : { anchor: point, focus: point })
+    setNameBox(indexToCellKey(point.row, point.col))
+  }, [commitEdit, editing])
 
-  // ────── Keyboard navigation ──────
+  const applyStyle = useCallback(patch => {
+    engine.setRangeStyle(selectedRange, patch)
+    refresh()
+  }, [engine, refresh, selectedRange])
 
-  const handleKeyDown = useCallback((event, row, col) => {
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
-    } else if (event.key === 'Tab') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(row, Math.min(col + 1, engine.cols - 1))
-    } else if (event.key === 'Escape') {
-      setEditValue(engine.getCell(row, col).raw)
-      setEditingCell(null)
-    } else if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
-    } else if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.max(row - 1, 0), col)
-    } else if (event.key === 'ArrowLeft') {
-      event.preventDefault()
-      commitEdit(row, col)
-      if (col > 0) {
-        startEditing(row, col - 1)
-      } else if (row > 0) {
-        startEditing(row - 1, engine.cols - 1)
+  const clearSelection = useCallback(() => {
+    engine.clearRange(selectedRange)
+    refresh()
+  }, [engine, refresh, selectedRange])
+
+  const moveSelection = useCallback((rowDelta, colDelta, extend = false) => {
+    const origin = selection.focus
+    const point = { row: Math.max(0, Math.min(engine.rows - 1, origin.row + rowDelta)), col: Math.max(0, Math.min(engine.cols - 1, origin.col + colDelta)) }
+    selectCell(point, extend)
+    scrollToCell(point.row, point.col)
+  }, [engine.cols, engine.rows, scrollToCell, selectCell, selection.focus])
+
+  useEffect(() => {
+    const finishPointer = () => {
+      if (dragRef.current.filling && fillPreview) {
+        engine.fillRange(selectedRange, fillPreview)
+        setSelection({ anchor: selectedRange ? { row: selectedRange.startRow, col: selectedRange.startCol } : selection.anchor, focus: { row: fillPreview.endRow, col: fillPreview.endCol } })
+        refresh()
       }
-    } else if (event.key === 'ArrowRight') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(row, Math.min(col + 1, engine.cols - 1))
+      dragRef.current = { active: false, filling: false, resize: null }
+      setFillPreview(null)
     }
-  }, [engine, commitEdit, startEditing])
-
-  // ────── Formula bar handlers ──────
-
-  const handleFormulaBarKeyDown = useCallback((event) => {
-    if (!editingCell) return
-    handleKeyDown(event, editingCell.r, editingCell.c)
-  }, [editingCell, handleKeyDown])
-
-  const handleFormulaBarFocus = useCallback(() => {
-    if (selectedCell && !editingCell) {
-      setEditingCell(selectedCell)
-      setEditValue(engine.getCell(selectedCell.r, selectedCell.c).raw)
+    const handlePointerMove = event => {
+      const resize = dragRef.current.resize
+      if (!resize) return
+      const delta = resize.axis === 'column' ? event.clientX - resize.start : event.clientY - resize.start
+      if (resize.axis === 'column') engine.setColumnWidth(resize.index, resize.size + delta)
+      else engine.setRowHeight(resize.index, resize.size + delta)
+      refresh()
     }
-  }, [selectedCell, editingCell, engine])
+    window.addEventListener('pointerup', finishPointer)
+    window.addEventListener('pointermove', handlePointerMove)
+    return () => { window.removeEventListener('pointerup', finishPointer); window.removeEventListener('pointermove', handlePointerMove) }
+  }, [engine, fillPreview, refresh, selectedRange, selection.anchor])
 
-  const handleFormulaBarChange = useCallback((value) => {
-    if (!editingCell && selectedCell) setEditingCell(selectedCell)
-    setEditValue(value)
-  }, [editingCell, selectedCell])
-
-  // ────── Undo / Redo ──────
-
-  const handleUndo = useCallback(() => { if (engine.undo()) forceRerender() }, [engine, forceRerender])
-  const handleRedo = useCallback(() => { if (engine.redo()) forceRerender() }, [engine, forceRerender])
-
-  // ────── Formatting toggles ──────
-
-  const toggleBold = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { bold: !style.bold })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const toggleItalic = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { italic: !style.italic })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const toggleUnderline = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { underline: !style.underline })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const changeFontSize = useCallback((size) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { fontSize: size })
-  }, [selectedCell, updateCellStyle])
-
-  const changeAlignment = useCallback((align) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { align })
-  }, [selectedCell, updateCellStyle])
-
-  const changeFontColor = useCallback((color) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { color })
-  }, [selectedCell, updateCellStyle])
-
-  const changeBackgroundColor = useCallback((color) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { bg: color })
-  }, [selectedCell, updateCellStyle])
-
-  // ────── Clear operations ──────
-
-  const clearSelectedCell = useCallback(() => {
-    if (!selectedCell) return
-    engine.setCell(selectedCell.r, selectedCell.c, '')
-    forceRerender()
-    // Remove style entry for cleared cell
-    // Note: This deletes the style object entirely - if you need to preserve default styles,
-    // you may want to set them explicitly rather than deleting
-    const key = `${selectedCell.r},${selectedCell.c}`
-    setCellStyles(prev => { const next = { ...prev }; delete next[key]; return next })
-    setEditValue('')
-  }, [selectedCell, engine, forceRerender])
-
-  const clearAllCells = useCallback(() => {
-    for (let r = 0; r < engine.rows; r++) {
-      for (let c = 0; c < engine.cols; c++) {
-        engine.setCell(r, c, '')
-      }
+  useEffect(() => {
+    const onKeyDown = event => {
+      if (event.ctrlKey && event.key.toLowerCase() === 'k') { event.preventDefault(); setAiOpen(true); return }
+      if (event.ctrlKey && event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) engine.redo(); else engine.undo(); refresh(); return }
+      if (event.ctrlKey && event.key.toLowerCase() === 'a') { event.preventDefault(); setSelection({ anchor: { row: used.startRow, col: used.startCol }, focus: { row: used.endRow, col: used.endCol } }); return }
+      if (editing) return
+      if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); clearSelection(); return }
+      if (event.key === 'Enter' || event.key === 'F2') { event.preventDefault(); beginEdit(selection.focus); return }
+      if (event.key === 'ArrowDown') { event.preventDefault(); moveSelection(1, 0, event.shiftKey); return }
+      if (event.key === 'ArrowUp') { event.preventDefault(); moveSelection(-1, 0, event.shiftKey); return }
+      if (event.key === 'ArrowLeft') { event.preventDefault(); moveSelection(0, -1, event.shiftKey); return }
+      if (event.key === 'ArrowRight') { event.preventDefault(); moveSelection(0, 1, event.shiftKey); return }
+      if (event.key === 'PageDown') { event.preventDefault(); moveSelection(Math.ceil(viewport.height / 24), 0, event.shiftKey); return }
+      if (event.key === 'PageUp') { event.preventDefault(); moveSelection(-Math.ceil(viewport.height / 24), 0, event.shiftKey); return }
+      if (event.ctrlKey && event.key === 'Home') { event.preventDefault(); selectCell({ row: 0, col: 0 }); scrollToCell(0, 0); return }
+      if (event.ctrlKey && event.key === 'End') { event.preventDefault(); selectCell({ row: used.endRow, col: used.endCol }); scrollToCell(used.endRow, used.endCol); return }
+      if (!event.ctrlKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); beginEdit(selection.focus, event.key) }
     }
-    forceRerender()
-    setCellStyles({})
-    setSelectedCell(null)
-    setEditingCell(null)
-    setEditValue('')
-  }, [engine, forceRerender])
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [beginEdit, clearSelection, editing, engine, moveSelection, refresh, scrollToCell, selectCell, selection.focus, used, viewport.height])
 
-  // ────── Sample data (fixtures/sales.tsv) ──────
+  const onScroll = event => {
+    const element = event.currentTarget
+    setViewport(current => ({ ...current, left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight }))
+  }
 
-  const loadSample = useCallback((loader) => {
+  const loadSample = loader => {
     loader(engine)
-    forceRerender()
-    setSelectedCell({ r: 0, c: 0 })
-    setEditingCell(null)
-    setEditValue('')
-  }, [engine, forceRerender])
+    setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    refresh()
+  }
 
-  // ────── Row / Column operations ──────
+  const beginResize = (event, axis, index) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragRef.current.resize = { axis, index, start: axis === 'column' ? event.clientX : event.clientY, size: axis === 'column' ? engine.getColumnWidth(index) : engine.getRowHeight(index) }
+  }
 
-  const insertRow = useCallback(() => {
-    if (!selectedCell) return
-    engine.insertRow(selectedCell.r)
-    forceRerender()
-    setSelectedCell({ r: selectedCell.r + 1, c: selectedCell.c })
-  }, [selectedCell, engine, forceRerender])
+  const cycleSort = column => {
+    const direction = sortState?.column === column ? (sortState.direction === 'asc' ? 'desc' : sortState.direction === 'desc' ? 'original' : 'asc') : 'asc'
+    engine.sortRange({ column, direction })
+    setSortState({ column, direction })
+    refresh()
+  }
 
-  const deleteRow = useCallback(() => {
-    if (!selectedCell) return
-    engine.deleteRow(selectedCell.r)
-    forceRerender()
-    if (selectedCell.r >= engine.rows) {
-      setSelectedCell({ r: engine.rows - 1, c: selectedCell.c })
+  const applyFilter = () => {
+    if (filterMenu === null) return
+    engine.setFilter(filterMenu, { values: filterValues.length === distinctFilterValues.length ? null : filterValues, conditions: filterOp === 'isEmpty' ? [{ op: filterOp }] : [{ op: filterOp, value: filterValue }] })
+    setFilterMenu(null)
+    refresh()
+  }
+
+  const jumpToName = event => {
+    event.preventDefault()
+    const point = parseCellKey(nameBox)
+    if (!point) return
+    engine.ensureCapacity(point.row + 1, point.col + 1)
+    selectCell(point)
+    scrollToCell(point.row, point.col)
+    refresh()
+  }
+
+  const sendAi = async event => {
+    event.preventDefault()
+    const prompt = aiPrompt.trim()
+    if (!prompt) return
+    setAiPending({ status: 'loading', prompt })
+    try {
+      const context = buildSheetContext(engine, selection)
+      const provider = createProvider()
+      const response = await provider.complete({ system: `${buildSystemPrompt()}\nContext:\n${JSON.stringify(context)}`, user: JSON.stringify({ context, prompt }), history: aiHistory })
+      const parsed = parseAndValidateAction(response.text)
+      if (!parsed.ok) {
+        setAiPending({ status: 'error', prompt, error: parsed.error })
+      } else if (parsed.value.type === 'query') {
+        const result = executeQuery(engine.getTableSnapshot(), parsed.value)
+        setAiPending(result.error ? { status: 'error', prompt, plan: parsed.value, error: result.detail ?? result.error } : { status: 'query', prompt, plan: parsed.value, result })
+      } else if (parsed.value.type === 'format_sheet') {
+        const preview = previewFormat(engine, parsed.value)
+        setAiPending(preview.error ? { status: 'error', prompt, plan: parsed.value, error: preview.detail ?? preview.error } : { status: 'format', prompt, plan: parsed.value, preview })
+      } else {
+        setAiPending({ status: 'clarify', prompt, plan: parsed.value })
+      }
+      setAiHistory(history => [...history, { role: 'user', content: prompt }, { role: 'assistant', content: response.text }])
+      setAiPrompt('')
+    } catch (error) {
+      setAiPending({ status: 'error', prompt, error: error.message })
     }
-  }, [selectedCell, engine, forceRerender])
+  }
 
-  const insertColumn = useCallback(() => {
-    if (!selectedCell) return
-    engine.insertColumn(selectedCell.c)
-    forceRerender()
-    setSelectedCell({ r: selectedCell.r, c: selectedCell.c + 1 })
-  }, [selectedCell, engine, forceRerender])
+  const rerunQuery = () => {
+    if (aiPending?.status !== 'query') return
+    const result = executeQuery(engine.getTableSnapshot(), aiPending.plan)
+    setAiPending(result.error ? { ...aiPending, status: 'error', error: result.detail ?? result.error } : { ...aiPending, result })
+  }
 
-  const deleteColumn = useCallback(() => {
-    if (!selectedCell) return
-    engine.deleteColumn(selectedCell.c)
-    forceRerender()
-    if (selectedCell.c >= engine.cols) {
-      setSelectedCell({ r: selectedCell.r, c: engine.cols - 1 })
-    }
-  }, [selectedCell, engine, forceRerender])
+  const insertAiResult = () => {
+    if (aiPending?.status !== 'query') return
+    engine.insertTable(destination, aiPending.result)
+    refresh()
+  }
 
-  // ────── Derived state ──────
+  const applyAiFormat = () => {
+    if (aiPending?.status !== 'format') return
+    const result = applyFormat(engine, aiPending.plan)
+    setAiPending({ ...aiPending, applied: result })
+    refresh()
+  }
 
-  const selectedCellStyle = useMemo(() => {
-    return selectedCell ? getCellStyle(selectedCell.r, selectedCell.c) : null
-  }, [selectedCell, getCellStyle])
+  const visibleRowsForRender = Array.from({ length: visible.endRow - visible.startRow + 1 }, (_, offset) => visible.startRow + offset)
+  const visibleColumnsForRender = Array.from({ length: visible.endCol - visible.startCol + 1 }, (_, offset) => visible.startCol + offset)
+  const bodyCells = visibleRowsForRender.flatMap(row => visibleColumnsForRender.flatMap(col => {
+    if (row === 0 || col === 0) return []
+    const cell = engine.getDisplayCell(row, col)
+    const active = within(selectedRange, row, col)
+    const isEditing = samePoint(editing, { row, col })
+    return [
+        <div
+          key={`${row}:${col}`}
+          className={`grid-cell ${active ? 'selected' : ''}`}
+          style={{ left: ROW_HEADER + columnOffsets[col], top: COLUMN_HEADER + rowOffsets[row], width: engine.getColumnWidth(col), height: engine.getRowHeight(row), ...cellCss(cell.style) }}
+          onPointerDown={event => { event.preventDefault(); dragRef.current.active = true; selectCell({ row, col }, event.shiftKey) }}
+          onPointerEnter={() => { if (dragRef.current.active) setSelection(previous => ({ anchor: previous.anchor, focus: { row, col } })); if (dragRef.current.filling) setFillPreview({ startRow: selectedRange.startRow, startCol: selectedRange.startCol, endRow: row, endCol: col }) }}
+          onDoubleClick={() => beginEdit({ row, col })}
+        >
+          {isEditing ? <input ref={inputRef} className="cell-editor" value={editValue} onChange={event => setEditValue(event.target.value)} onBlur={commitEdit} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); commitEdit(); moveSelection(1, 0) } if (event.key === 'Escape') { setEditing(null) } }} /> : <span>{cell.display}</span>}
+          {row === selectedRange.endRow && col === selectedRange.endCol && <button className="fill-handle" title="Drag to fill" onPointerDown={event => { event.stopPropagation(); dragRef.current.filling = true }} />}
+        </div>,
+    ]
+  }))
 
-  const getColumnLabel = useCallback((col) => {
-    let label = ''
-    let num = col + 1
-    while (num > 0) {
-      num--
-      label = String.fromCharCode(65 + (num % 26)) + label
-      num = Math.floor(num / 26)
-    }
-    return label
-  }, [])
-
-  const selectedCellLabel = selectedCell
-    ? `${getColumnLabel(selectedCell.c)}${selectedCell.r + 1}`
-    : 'No cell'
-
-  // Formula bar shows the raw formula text, not the computed value
-  // When editing, show the current editValue; otherwise show the cell's raw content
-  // Note: This is different from the cell display, which shows computed values
-  const formulaBarValue = editingCell
-    ? editValue
-    : (selectedCell ? engine.getCell(selectedCell.r, selectedCell.c).raw : '')
-
-  // ────── Render ──────
+  const frozenTopCells = visibleColumnsForRender.map(col => {
+    const cell = engine.getDisplayCell(0, col)
+    return <div key={`top:${col}`} className={`grid-cell frozen-row ${within(selectedRange, 0, col) ? 'selected' : ''}`} style={{ left: ROW_HEADER + columnOffsets[col] - viewport.left, top: COLUMN_HEADER, width: engine.getColumnWidth(col), height: engine.getRowHeight(0), ...cellCss(cell.style) }} onPointerDown={event => { event.preventDefault(); selectCell({ row: 0, col }, event.shiftKey) }} onDoubleClick={() => beginEdit({ row: 0, col })}>{samePoint(editing, { row: 0, col }) ? <input ref={inputRef} className="cell-editor" value={editValue} onChange={event => setEditValue(event.target.value)} onBlur={commitEdit} /> : <span>{cell.display}</span>}</div>
+  })
+  const frozenLeftCells = visibleRowsForRender.filter(row => row !== 0).map(row => {
+    const cell = engine.getDisplayCell(row, 0)
+    return <div key={`left:${row}`} className={`grid-cell frozen-column ${within(selectedRange, row, 0) ? 'selected' : ''}`} style={{ left: ROW_HEADER, top: COLUMN_HEADER + rowOffsets[row] - viewport.top, width: engine.getColumnWidth(0), height: engine.getRowHeight(row), ...cellCss(cell.style) }} onPointerDown={event => { event.preventDefault(); selectCell({ row, col: 0 }, event.shiftKey) }} onDoubleClick={() => beginEdit({ row, col: 0 })}><span>{cell.display}</span></div>
+  })
+  const frozenCells = [...frozenTopCells, ...frozenLeftCells]
 
   return (
-    <div className="app-wrapper">
-      <div className="app-header">
-        <h2 className="app-title">📊 Spreadsheet App</h2>
-      </div>
-
-      <div className="main-content">
-
-        {/* ── Toolbar ── */}
-        <div className="toolbar">
-          <div className="toolbar-group">
-            <button className={`toolbar-btn bold-btn ${selectedCellStyle?.bold ? 'active' : ''}`} onClick={toggleBold} title="Bold">B</button>
-            <button className={`toolbar-btn italic-btn ${selectedCellStyle?.italic ? 'active' : ''}`} onClick={toggleItalic} title="Italic">I</button>
-            <button className={`toolbar-btn underline-btn ${selectedCellStyle?.underline ? 'active' : ''}`} onClick={toggleUnderline} title="Underline">U</button>
-          </div>
-
-          <div className="toolbar-group">
-            <span className="toolbar-label">Size:</span>
-            <select className="toolbar-select" value={selectedCellStyle?.fontSize || 13} onChange={(e) => changeFontSize(parseInt(e.target.value))}>
-              {[8, 10, 11, 12, 13, 14, 16, 18, 20, 24].map(s => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="toolbar-group">
-            <button className={`align-btn ${selectedCellStyle?.align === 'left' ? 'active' : ''}`} onClick={() => changeAlignment('left')} title="Align Left">⬤←</button>
-            <button className={`align-btn ${selectedCellStyle?.align === 'center' ? 'active' : ''}`} onClick={() => changeAlignment('center')} title="Align Center">⬤</button>
-            <button className={`align-btn ${selectedCellStyle?.align === 'right' ? 'active' : ''}`} onClick={() => changeAlignment('right')} title="Align Right">⬤→</button>
-          </div>
-
-          <div className="toolbar-group">
-            <span className="toolbar-label">Text:</span>
-            <input
-              type="color"
-              value={selectedCellStyle?.color || '#000000'}
-              onChange={(e) => changeFontColor(e.target.value)}
-              title="Font color"
-              style={{ width: '32px', height: '32px', border: '1px solid #dadce0', cursor: 'pointer', borderRadius: '4px' }}
-            />
-          </div>
-
-          <div className="toolbar-group">
-            <span className="toolbar-label">Fill:</span>
-            <select className="toolbar-select" value={selectedCellStyle?.bg || 'white'} onChange={(e) => changeBackgroundColor(e.target.value)}>
-              <option value="white">White</option>
-              <option value="#ffff99">Yellow</option>
-              <option value="#99ffcc">Green</option>
-              <option value="#ffcccc">Red</option>
-              <option value="#cce5ff">Blue</option>
-              <option value="#e0ccff">Purple</option>
-              <option value="#ffd9b3">Orange</option>
-              <option value="#f0f0f0">Gray</option>
-            </select>
-          </div>
-
-          <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={handleUndo} disabled={!engine.canUndo()} title="Undo">↶ Undo</button>
-            <button className="toolbar-btn" onClick={handleRedo} disabled={!engine.canRedo()} title="Redo">↷ Redo</button>
-          </div>
-
-          <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={insertRow} title="Insert Row">+ Row</button>
-            <button className="toolbar-btn" onClick={deleteRow} title="Delete Row">- Row</button>
-            <button className="toolbar-btn" onClick={insertColumn} title="Insert Column">+ Col</button>
-            <button className="toolbar-btn" onClick={deleteColumn} title="Delete Column">- Col</button>
-          </div>
-
-          <div className="toolbar-group">
-            <button className="toolbar-btn danger" onClick={clearSelectedCell}>✕ Cell</button>
-            <button className="toolbar-btn danger" onClick={clearAllCells}>✕ All</button>
-          </div>
-
-          <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={() => loadSample(loadSampleSmall)} title="Load fixtures/sales.tsv (33 rows) at A1">⬇ Sample 33</button>
-            <button className="toolbar-btn" onClick={() => loadSample(loadSampleLarge)} title="Load fixtures/sales-large.tsv (~3,000 rows) at A1">⬇ Sample 3k</button>
-          </div>
+    <main className="app-shell">
+      <header className="app-header"><div><strong>Spreadsheet</strong><span className="subtle">Pure engine · virtual grid · deterministic AI</span></div><button onClick={() => setAiOpen(true)}>Ask AI <kbd>Ctrl K</kbd></button></header>
+      <section className="toolbar" aria-label="Spreadsheet toolbar">
+        <button className={rangeStyle.bold ? 'active' : ''} onClick={() => applyStyle({ bold: !rangeStyle.bold })}><b>B</b></button>
+        <button className={rangeStyle.italic ? 'active' : ''} onClick={() => applyStyle({ italic: !rangeStyle.italic })}><i>I</i></button>
+        <button className={rangeStyle.underline ? 'active' : ''} onClick={() => applyStyle({ underline: !rangeStyle.underline })}><u>U</u></button>
+        <select value={rangeStyle.numberFormat} onChange={event => applyStyle({ numberFormat: event.target.value })}><option value="general">General</option><option value="number">Number</option><option value="currency">Currency</option><option value="percent">Percent</option><option value="date">Date</option></select>
+        <select value={rangeStyle.align} onChange={event => applyStyle({ align: event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select>
+        <input aria-label="Background color" type="color" value={rangeStyle.bg === 'white' ? '#ffffff' : rangeStyle.bg} onChange={event => applyStyle({ bg: event.target.value })} />
+        <button onClick={() => { engine.undo(); refresh() }} disabled={!engine.canUndo()}>Undo</button><button onClick={() => { engine.redo(); refresh() }} disabled={!engine.canRedo()}>Redo</button>
+        <button onClick={() => { engine.insertRow(selection.focus.row); refresh() }}>+ Row</button><button onClick={() => { engine.insertColumn(selection.focus.col); refresh() }}>+ Col</button>
+        <button onClick={clearSelection}>Clear</button><button onClick={() => loadSample(loadSampleSmall)}>Sample 33</button><button onClick={() => loadSample(loadSampleLarge)}>Sample 3k</button>
+      </section>
+      <section className="formula-row">
+        <form onSubmit={jumpToName}><input aria-label="Name box" value={nameBox} onChange={event => setNameBox(event.target.value)} /></form>
+        <input className="formula-input" aria-label="Formula bar" value={editing ? editValue : selectedCell.raw} onChange={event => { if (!editing) beginEdit(selection.focus, event.target.value); else setEditValue(event.target.value) }} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); commitEdit() } }} />
+        <span>{rangeToA1(selectedRange)}</span>
+      </section>
+      <section className="grid-shell">
+        <div ref={scrollRef} className="grid-scroll" onScroll={onScroll} onPointerDown={event => { if (event.target === event.currentTarget) selectCell({ row: 0, col: 0 }) }}>
+          <div className="grid-canvas" style={{ width: ROW_HEADER + columnOffsets[columnOffsets.length - 1], height: COLUMN_HEADER + rowOffsets[rowOffsets.length - 1] }}>{bodyCells}</div>
         </div>
-
-        {/* ── Formula Bar ── */}
-        <div className="formula-bar">
-          <span className="formula-bar-label">{selectedCellLabel}</span>
-          <input
-            className="formula-bar-input"
-            value={formulaBarValue}
-            onChange={(e) => handleFormulaBarChange(e.target.value)}
-            onKeyDown={handleFormulaBarKeyDown}
-            onFocus={handleFormulaBarFocus}
-            placeholder="Select a cell then type, or enter a formula like =SUM(A1:A5)"
-          />
+        <div className="column-layer">
+          <div className="corner" onClick={() => setSelection({ anchor: { row: used.startRow, col: used.startCol }, focus: { row: used.endRow, col: used.endCol } })} />
+          {Array.from({ length: visible.endCol - visible.startCol + 1 }, (_, offset) => { const col = visible.startCol + offset; return <div key={col} className="column-header" style={{ left: ROW_HEADER + columnOffsets[col] - viewport.left, width: engine.getColumnWidth(col) }} onClick={() => setSelection({ anchor: { row: 0, col }, focus: { row: engine.rows - 1, col } })} onDoubleClick={() => { engine.autoFitColumns([col]); refresh() }}><span>{indexToColumnLetter(col)}</span><button aria-label={`Sort column ${indexToColumnLetter(col)}`} title="Sort" onClick={event => { event.stopPropagation(); cycleSort(col) }}>↕</button><button aria-label={`Filter column ${indexToColumnLetter(col)}`} onClick={event => { event.stopPropagation(); setFilterMenu(col); setFilterSearch(''); setFilterValues(collectDistinctFilterValues(col)) }}>⌄</button><i onPointerDown={event => beginResize(event, 'column', col)} /></div> })}
         </div>
-
-        {/* ── Grid ── */}
-        <div className="grid-scroll">
-          <table className="grid-table">
-            <thead>
-              <tr>
-                <th className="col-header-blank"></th>
-                {Array.from({ length: engine.cols }, (_, colIndex) => (
-                  <th key={colIndex} className="col-header">
-                    {getColumnLabel(colIndex)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {Array.from({ length: engine.rows }, (_, rowIndex) => (
-                <tr key={rowIndex}>
-                  <td className="row-header">{rowIndex + 1}</td>
-                  {Array.from({ length: engine.cols }, (_, colIndex) => {
-                    const isSelected = selectedCell?.r === rowIndex && selectedCell?.c === colIndex
-                    const isEditing = editingCell?.r === rowIndex && editingCell?.c === colIndex
-                    const cellData = engine.getCell(rowIndex, colIndex)
-                    const style = cellStyles[`${rowIndex},${colIndex}`] || {}
-                    const displayValue = cellData.error
-                      ? cellData.error
-                      : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
-
-                    return (
-                      <td
-                        key={colIndex}
-                        className={`cell ${isSelected ? 'selected' : ''}`}
-                        style={{ background: style.bg || 'white' }}
-                        onMouseDown={(e) => { e.preventDefault(); handleCellClick(rowIndex, colIndex) }}
-                      >
-                        {isEditing ? (
-                          <input
-                            autoFocus
-                            className="cell-input"
-                            value={editValue}
-                            onChange={(e) => setEditValue(e.target.value)}
-                            onBlur={() => commitEdit(rowIndex, colIndex)}
-                            onKeyDown={(e) => handleKeyDown(e, rowIndex, colIndex)}
-                            ref={isSelected ? cellInputRef : undefined}
-                            style={{
-                              fontWeight: style.bold ? 'bold' : 'normal',
-                              fontStyle: style.italic ? 'italic' : 'normal',
-                              textDecoration: style.underline ? 'underline' : 'none',
-                              color: style.color || '#202124',
-                              fontSize: (style.fontSize || 13) + 'px',
-                              textAlign: style.align || 'left',
-                              background: style.bg || 'white',
-                            }}
-                          />
-                        ) : (
-                          <div
-                            className={`cell-display align-${style.align || 'left'} ${cellData.error ? 'error' : ''}`}
-                            style={{
-                              fontWeight: style.bold ? 'bold' : 'normal',
-                              fontStyle: style.italic ? 'italic' : 'normal',
-                              textDecoration: style.underline ? 'underline' : 'none',
-                              color: cellData.error ? '#d93025' : (style.color || '#202124'),
-                              fontSize: (style.fontSize || 13) + 'px',
-                            }}
-                          >
-                            {displayValue}
-                          </div>
-                        )}
-                      </td>
-                    )
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <p className="footer-hint">
-          Click a cell to edit · Enter/Tab/Arrow keys to navigate · Formulas: =A1+B1 · =SUM(A1:A5) · =AVG(A1:A5) · =MAX(A1:A5) · =MIN(A1:A5)
-        </p>
-      </div>
-    </div>
+        <div className="row-layer">{Array.from({ length: visible.endRow - visible.startRow + 1 }, (_, offset) => { const row = visible.startRow + offset; return <div key={row} className="row-header" style={{ top: COLUMN_HEADER + rowOffsets[row] - viewport.top, height: engine.getRowHeight(row) }} onClick={() => setSelection({ anchor: { row, col: 0 }, focus: { row, col: engine.cols - 1 } })}><span>{row + 1}</span><i onPointerDown={event => beginResize(event, 'row', row)} /></div> })}</div>
+        <div className="frozen-layer">{frozenCells}</div>
+        {filterMenu !== null && <aside className="filter-menu" style={{ left: Math.max(ROW_HEADER, ROW_HEADER + columnOffsets[filterMenu] - viewport.left), top: COLUMN_HEADER + 4 }}><strong>Filter {indexToColumnLetter(filterMenu)}</strong><input value={filterSearch} onChange={event => setFilterSearch(event.target.value)} placeholder="Search values" /><div className="filter-values">{distinctFilterValues.filter(value => value.toLowerCase().includes(filterSearch.toLowerCase())).slice(0, 100).map(value => <label key={value || '(blank)'}><input type="checkbox" checked={filterValues.includes(value)} onChange={event => setFilterValues(values => event.target.checked ? [...values, value] : values.filter(item => item !== value))} /> {value || '(Blanks)'}</label>)}</div><select value={filterOp} onChange={event => setFilterOp(event.target.value)}><option value="contains">contains</option><option value="gt">greater than</option><option value="lt">less than</option><option value="isEmpty">is empty</option></select>{filterOp !== 'isEmpty' && <input value={filterValue} onChange={event => setFilterValue(event.target.value)} placeholder="Condition value" />}<div><button onClick={applyFilter}>Apply</button><button onClick={() => { engine.clearFilter(filterMenu); setFilterMenu(null); refresh() }}>Clear</button></div><small>{visibleRows.length} of {Math.max(0, used.rowCount - 1)} rows visible</small></aside>}
+      </section>
+      <footer>{visibleRows.length} of {Math.max(0, used.rowCount - 1)} rows visible · {engine.rows.toLocaleString()} rows × {engine.cols} columns · Selection: {rangeToA1(selectedRange)}</footer>
+      {aiOpen && <aside className="ai-panel" aria-label="Ask your data"><header><strong>Ask your data</strong><button onClick={() => setAiOpen(false)}>×</button></header><form onSubmit={sendAi}><textarea value={aiPrompt} onChange={event => setAiPrompt(event.target.value)} placeholder="Ask a question or request formatting" /><button disabled={!aiPrompt.trim()}>Send</button></form><label className="plan-toggle"><input type="checkbox" checked={showPlan} onChange={event => setShowPlan(event.target.checked)} /> Show plan</label>{aiPending?.status === 'loading' && <p>Creating a validated plan…</p>}{aiPending?.status === 'error' && <p className="ai-error">{aiPending.error}</p>}{aiPending?.status === 'clarify' && <p>{aiPending.plan.question}</p>}{aiPending?.status === 'query' && <section className="ai-card"><strong>{aiPending.result.rowCount} result rows{aiPending.result.truncated ? ' (truncated)' : ''}</strong><p>The spreadsheet executed the validated query locally.</p>{showPlan && <pre>{JSON.stringify(aiPending.plan, null, 2)}</pre>}<div className="result-table"><table><thead><tr>{aiPending.result.columns.map(column => <th key={column}>{column}</th>)}</tr></thead><tbody>{aiPending.result.rows.slice(0, 25).map((row, index) => <tr key={index}>{row.map((value, col) => <td key={col}>{String(value ?? '')}</td>)}</tr>)}</tbody></table></div><button onClick={rerunQuery}>Re-run</button><input value={destination} onChange={event => setDestination(event.target.value)} aria-label="Insert destination" /><button onClick={insertAiResult}>Insert into sheet</button></section>}{aiPending?.status === 'format' && <section className="ai-card"><p>{aiPending.preview.description}</p>{showPlan && <pre>{JSON.stringify(aiPending.plan, null, 2)}</pre>}{aiPending.applied ? <p>{aiPending.applied.error ?? aiPending.applied.result}</p> : <><button onClick={applyAiFormat}>Apply once</button><button onClick={() => setAiPending(null)}>Discard</button></>}</section>}</aside>}
+    </main>
   )
 }
